@@ -54,6 +54,10 @@ MEDIA_GROUP_BUFFER = {}  # media_group_id -> {items, has_mention, meta, timer}
 
 
 # ----------------- HELPERS -----------------
+def escape_html(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def get_message_content(message):
     """Текст або підпис (caption)"""
     if message.text:
@@ -92,12 +96,15 @@ def make_meta(message):
     else:
         time_str = "Невідомий час"
 
+    content = get_message_content(message) or ""
+
     return {
         "chat_title": chat_title,
         "from_name": from_name,
         "from_username": from_username,
         "time_str": time_str,
         "link_text": build_message_link(message),
+        "content": content,
     }
 
 
@@ -116,8 +123,7 @@ def album_to_input_media(items):
     media = []
     for m in items:
         if m.photo:
-            # найякісніший варіант фото
-            file_id = m.photo[-1].file_id
+            file_id = m.photo[-1].file_id  # найякісніший варіант
             media.append(InputMediaPhoto(media=file_id))
         elif m.video:
             media.append(InputMediaVideo(media=m.video.file_id))
@@ -127,7 +133,7 @@ def album_to_input_media(items):
 
 
 def flush_media_group(media_group_id, context):
-    """Відправляє header + альбом одним постом (sendMediaGroup), інкрементує лічильник 1 раз."""
+    """Відправляє header + (опц.) текст + альбом одним постом (sendMediaGroup), інкрементує лічильник 1 раз."""
     global REQUEST_COUNTER
 
     bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
@@ -160,12 +166,24 @@ def flush_media_group(media_group_id, context):
         logger.exception("❌ Не зміг відправити header для альбому %s: %s", media_group_id, e)
         return
 
+    # 1.1) Текст/підпис окремим повідомленням (щоб не губився)
+    try:
+        if meta.get("content"):
+            safe = escape_html(meta["content"])
+            context.bot.send_message(
+                chat_id=FORWARD_CHAT_ID,
+                text=f"<b>💬 Текст:</b>\n{safe}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+    except Exception as e:
+        logger.exception("❌ Не зміг відправити текст для альбому %s: %s", media_group_id, e)
+
     # 2) Альбом одним постом
     media = album_to_input_media(items)
 
     try:
         if not media:
-            # fallback
             logger.info("Альбом %s: нема медіа для sendMediaGroup, fallback на forward", media_group_id)
             for m in items:
                 m.forward(chat_id=FORWARD_CHAT_ID)
@@ -261,7 +279,17 @@ def check_mentions(update, context):
             parse_mode="HTML",
         )
 
-        # 2) пересилаємо саме повідомлення (текст/одиночне фото/відео/док)
+        # 1.1) Текст окремо (на випадок, якщо хочеш однаковий формат завжди)
+        if meta.get("content"):
+            safe = escape_html(meta["content"])
+            context.bot.send_message(
+                chat_id=FORWARD_CHAT_ID,
+                text=f"<b>💬 Текст:</b>\n{safe}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+        # 2) саме повідомлення (як forward) — щоб не губити контекст/відмітки Telegram
         message.forward(chat_id=FORWARD_CHAT_ID)
 
         # 3) counter
@@ -295,4 +323,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
