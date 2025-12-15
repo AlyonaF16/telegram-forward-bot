@@ -59,7 +59,7 @@ def build_message_link(message):
 
 # ----------------- ОСНОВНА ЛОГІКА -----------------
 
-def get_message_text(message):
+def get_message_content(message):
     # текст звичайного повідомлення
     if message.text:
         return message.text
@@ -84,7 +84,11 @@ def check_mentions(update, context):
         return
 
     # Перевіряємо наявність згадки
-    if f"@{USERNAME}" not in message.text:
+    content = get_message_content(message)
+    if not content:
+        return
+
+    if f"@{USERNAME}" not in content:
         return
 
     chat = message.chat
@@ -162,5 +166,6 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
