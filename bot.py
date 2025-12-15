@@ -194,10 +194,16 @@ def main():
     logger.info("Бот запущено | старт з №%s", REQUEST_COUNTER)
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
-    dp.add_handler(MessageHandler((Filters.text | Filters.caption) & ~Filters.command, check_mentions))
+    dp.add_handler(
+        MessageHandler(
+            (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
+            check_mentions
+        )
+    )
     updater.start_polling()
     updater.idle()
 
 if __name__ == "__main__":
     main()
+
 
