@@ -148,7 +148,12 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-   dp.add_handler(MessageHandler((Filters.text | Filters.caption) & ~Filters.command, check_mentions))
+    dp.add_handler(
+        MessageHandler(
+            (Filters.text | Filters.caption) & ~Filters.command, 
+            check_mentions,
+        )
+    )
 
     updater.start_polling()
     updater.idle()
@@ -157,4 +162,5 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
