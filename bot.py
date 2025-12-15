@@ -49,8 +49,8 @@ REQUEST_COUNTER = load_counter()
 
 # ----------------- MEDIA GROUP (ALBUMS) -----------------
 MEDIA_GROUP_DELAY_SEC = 2.5
-MEDIA_GROUP_BUFFER = {}  # media_group_id -> {items, has_mention, meta, timer}
-
+# media_group_id -> {items, has_mention, meta, timer, mention_msg_id}
+MEDIA_GROUP_BUFFER = {}
 
 # ----------------- HELPERS -----------------
 def escape_html(s: str) -> str:
@@ -106,7 +106,7 @@ def make_meta(message):
 
 def build_header(meta, number: int) -> str:
     return (
-        f"<b>🧨 Запит на опрацювання №{number}</b>\n"
+        f"<b>🧨 Запит на опрацювання №{number}🤪</b>\n"
         f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
         f"<b>🌐 Група:</b> {escape_html(meta['chat_title'])}\n"
         f"<b>🐈‍⬛ Хто тегнув:</b> {escape_html(meta['from_name'])} {escape_html(meta['from_username'])}\n"
@@ -132,8 +132,8 @@ def flush_media_group(media_group_id, context):
     """
     Альбом:
     - Header
-    - Текст (caption) як forward (перше повідомлення альбому)
-    - Фото плиткою через sendMediaGroup
+    - Текст як "переслано" (forward повідомлення, де був тег/текст)
+    - Фото плиткою (sendMediaGroup), але БЕЗ дубля — виключаємо форварднуте повідомлення
     """
     global REQUEST_COUNTER
 
@@ -149,6 +149,7 @@ def flush_media_group(media_group_id, context):
 
     number = REQUEST_COUNTER
     meta = bucket["meta"]
+    mention_msg_id = bucket.get("mention_msg_id")
     items = sorted(bucket["items"], key=lambda m: m.message_id)
 
     try:
@@ -159,27 +160,34 @@ def flush_media_group(media_group_id, context):
             parse_mode="HTML",
         )
 
-        # 2) Текст як "переслано": forward першого елемента (там caption)
-        first_message = items[0]
-        if first_message.caption:
-            first_message.forward(chat_id=FORWARD_CHAT_ID)
+        # 2) Forward "текстового" елемента альбому (той, де був тег)
+        forwarded_message = None
+        if mention_msg_id:
+            for m in items:
+                if m.message_id == mention_msg_id:
+                    forwarded_message = m
+                    break
+        if not forwarded_message:
+            forwarded_message = items[0]
 
-        # 3) Фото плиткою (без тексту)
-        media = album_to_input_media(items)
+        # forward дає "як переслано" і не губить caption
+        forwarded_message.forward(chat_id=FORWARD_CHAT_ID)
+
+        # 3) Фото плиткою, але БЕЗ дубля: виключаємо forwarded_message
+        remaining_items = [m for m in items if m.message_id != forwarded_message.message_id]
+        media = album_to_input_media(remaining_items)
+
         if media:
             for i in range(0, len(media), 10):
                 context.bot.send_media_group(
                     chat_id=FORWARD_CHAT_ID,
                     media=media[i:i + 10],
                 )
-        else:
-            # fallback
-            for m in items:
-                m.forward(chat_id=FORWARD_CHAT_ID)
+        # якщо залишилося 0 — значить альбом був з 1 елемента (рідко), і все вже форварднулося
 
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
-        logger.info("✅ Запит №%s (альбом: текст як forward, фото плиткою)", number)
+        logger.info("✅ Запит №%s (альбом без дубля) відправлено", number)
 
     except Exception as e:
         logger.exception("❌ Помилка альбому %s: %s", media_group_id, e)
@@ -218,7 +226,13 @@ def check_mentions(update, context):
     if media_group_id:
         bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
         if not bucket:
-            bucket = {"items": [], "has_mention": False, "meta": None, "timer": None}
+            bucket = {
+                "items": [],
+                "has_mention": False,
+                "meta": None,
+                "timer": None,
+                "mention_msg_id": None,
+            }
             MEDIA_GROUP_BUFFER[media_group_id] = bucket
 
             t = threading.Timer(MEDIA_GROUP_DELAY_SEC, flush_media_group, args=(media_group_id, context))
@@ -231,7 +245,8 @@ def check_mentions(update, context):
         if has_mention and not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
-            logger.info("🔥 Згадка знайдена в альбомі %s", media_group_id)
+            bucket["mention_msg_id"] = message.message_id  # запам’ятали, де саме був тег/текст
+            logger.info("🔥 Згадка знайдена в альбомі %s (msg_id=%s)", media_group_id, message.message_id)
 
         return
 
@@ -250,8 +265,8 @@ def check_mentions(update, context):
             parse_mode="HTML",
         )
 
-        # Просто текст -> forward (вигляд "переслано")
-        # 1 фото/відео/док -> forward (без змін, як зараз)
+        # Текст -> forward (як переслано)
+        # 1 фото/відео/док -> forward (без змін)
         message.forward(chat_id=FORWARD_CHAT_ID)
 
         REQUEST_COUNTER += 1
@@ -283,6 +298,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
