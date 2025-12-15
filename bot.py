@@ -1,6 +1,15 @@
 
 import time
 import os
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("mentions-bot")
+
 from datetime import timedelta
 from telegram.ext import Updater, MessageHandler, Filters
 
@@ -214,6 +223,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
