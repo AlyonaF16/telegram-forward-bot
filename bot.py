@@ -1,4 +1,5 @@
 
+import time
 import os
 from datetime import timedelta
 from telegram.ext import Updater, MessageHandler, Filters
@@ -33,6 +34,8 @@ else:
 
 # ----------------- ДОПОМОЖНІ ФУНКЦІЇ -----------------
 
+MEDIA_GROUP_BUFFER = {}  # media_group_id -> {"items": [message], "ts": float, "has_mention": bool, "meta": dict}
+MEDIA_GROUP_DELAY_SEC = 2.5
 
 def build_message_link(message):
     """
@@ -68,67 +71,112 @@ def get_message_content(message):
         return message.caption
     return None
 
+def flush_media_group(media_group_id, context):
+    global REQUEST_COUNTER
+
+    bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
+    if not bucket:
+        return
+
+    if not bucket["has_mention"]:
+        return
+
+    # Сортуємо по message_id щоб порядок був як у чаті
+    items = sorted(bucket["items"], key=lambda m: m.message_id)
+    meta = bucket["meta"]
+
+    header_text = (
+        f"<b>🧨 Запит на опрацювання🤪</b>\n"
+        f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
+        f"<b>🌐 Група:</b> {meta['chat_title']}\n"
+        f"<b>🐈‍⬛ Хто тегнув:</b> {meta['from_name']} {meta['from_username']}\n"
+        f"<b>🔗 Посилання:</b> {meta['link_text']}"
+    )
+
+    try:
+        logger.info("Альбом: відправляю header (Запит №%s), media_group_id=%s", current_request_no, media_group_id)
+        context.bot.send_message(
+            chat_id=FORWARD_CHAT_ID,
+            text=header_text,
+            parse_mode="HTML",
+        )
+
+        for m in items:
+            logger.info("Альбом: форварджу msg_id=%s", m.message_id)
+            m.forward(chat_id=FORWARD_CHAT_ID)
+
+        logger.info("✅ Запит №%s (альбом) успішно переслав, media_group_id=%s", current_request_no, media_group_id)
+
+    except Exception as e:
+        logger.exception("❌ Помилка при пересиланні альбому (Запит №%s): %s", current_request_no, e)
+
 def check_mentions(update, context):
+    global REQUEST_COUNTER
+
     message = update.message
-
-    # Немає повідомлення або тексту — нічого не робимо
-    content = get_message_content(message)
-    if not content:
-        return
-
-    if f"@{USERNAME}" not in content:
-        return
-
-    # Якщо ALLOWED_GROUP_IDS заданий — фільтруємо за групами
-    if ALLOWED_GROUP_IDS and message.chat.id not in ALLOWED_GROUP_IDS:
-        return
-
-    # Перевіряємо наявність згадки
-    content = get_message_content(message)
-    if not content:
-        return
-
-    if f"@{USERNAME}" not in content:
+    if not message:
+        logger.info("Update без message")
         return
 
     chat = message.chat
-    user = message.from_user
-
-    # Назва групи
     chat_title = chat.title or "Без назви"
 
-    # Хто тегнув
-    if user:
-        if user.last_name:
-            from_name = f"{user.first_name} {user.last_name}"
-        else:
-            from_name = user.first_name
-        from_username = f"@{user.username}" if user.username else ""
-    else:
-        from_name = "Невідомий користувач"
-        from_username = ""
+    # Лог: що взагалі прилетіло
+    logger.info(
+        "Update: chat_id=%s chat='%s' msg_id=%s has_text=%s has_caption=%s media_group_id=%s",
+        chat.id,
+        chat_title,
+        getattr(message, "message_id", None),
+        bool(message.text),
+        bool(message.caption),
+        getattr(message, "media_group_id", None),
+    )
 
-    # Час — message.date в UTC, додаємо +2 години під Київ
-    if message.date:
-        kyiv_time = message.date + timedelta(hours=2)
-        time_str = kyiv_time.strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        time_str = "Невідомий час"
+    # Якщо ALLOWED_GROUP_IDS заданий — фільтруємо за групами
+    if ALLOWED_GROUP_IDS and chat.id not in ALLOWED_GROUP_IDS:
+        logger.info("Пропуск: чат не в ALLOWED_GROUP_IDS")
+        return
 
-    # Посилання на повідомлення
-    msg_link = build_message_link(message)
-    if msg_link:
-        link_text = msg_link
-    else:
-        link_text = "Посилання недоступне (тип групи не підтримує прямі URL)"
+    content = get_message_text(message)
+    has_mention = bool(content) and (f"@{USERNAME}" in content)
 
-    # Формуємо службове повідомлення (HTML формат, жирні заголовки)
+    media_group_id = getattr(message, "media_group_id", None)
+
+    # --- 1) АЛЬБОМ (2+ фото/відео) ---
+    if media_group_id:
+        now = time.time()
+        bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
+
+        if not bucket:
+            bucket = {"items": [], "ts": now, "has_mention": False, "meta": None}
+            MEDIA_GROUP_BUFFER[media_group_id] = bucket
+
+        bucket["items"].append(message)
+
+        # Якщо згадка знайдена — запам'ятовуємо метадані (1 раз)
+        if has_mention and not bucket["has_mention"]:
+            bucket["has_mention"] = True
+            bucket["meta"] = make_meta_from_message(message)
+            logger.info("Знайшов згадку в альбомі: media_group_id=%s, чат='%s'", media_group_id, chat_title)
+
+        # Флашимо, коли пройшов таймер від першого елемента альбому
+        if now - bucket["ts"] >= MEDIA_GROUP_DELAY_SEC:
+            flush_media_group(media_group_id, context)
+
+        return
+
+    # --- 2) НЕ альбом — стандартна логіка ---
+    if not has_mention:
+        return
+
+    meta = make_meta_from_message(message)
+ 	
     header_text = (
- 		f"<b>🧨 Запит на опрацювання🤪</b>\n"
-                f"<b>🕓 Дата й час:</b> {time_str}\n"
-                f"<b>🌐 Група:</b> {chat_title}\n"
-                f"<b>🐈‍⬛ Хто тегнув:</b> {from_name} {from_username}\n"
-                f"<b>🔗 Посилання:</b> {link_text}"
+        f"<b>🧨 Запит на опрацювання🤪</b>\n"
+        f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
+        f"<b>🌐 Група:</b> {meta['chat_title']}\n"
+        f"<b>🐈‍⬛ Хто тегнув:</b> {meta['from_name']} {meta['from_username']}\n"
+        f"<b>🔗 Посилання:</b> {meta['link_text']}"
     )
 
     # Надсилаємо службове повідомлення в групу-приймач
@@ -166,6 +214,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
