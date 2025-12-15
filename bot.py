@@ -3,13 +3,12 @@ import time
 import threading
 import logging
 from datetime import timedelta
+
+from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Updater, MessageHandler, Filters
 
 # ----------------- LOGGING -----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("mentions-bot")
 
 # ----------------- ENV -----------------
@@ -28,44 +27,54 @@ ALLOWED_GROUP_IDS_ENV = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if ALLOWED_GROUP_IDS_ENV:
     ALLOWED_GROUP_IDS = {int(x.strip()) for x in ALLOWED_GROUP_IDS_ENV.split(",") if x.strip()}
 else:
-    ALLOWED_GROUP_IDS = set()
+    ALLOWED_GROUP_IDS = set()  # порожній = слухати всі групи
 
-# ----------------- COUNTER -----------------
+# ----------------- COUNTER (GLOBAL) -----------------
 COUNTER_FILE = "counter.txt"
 
-def load_counter():
+
+def load_counter() -> int:
     try:
         with open(COUNTER_FILE, "r", encoding="utf-8") as f:
             return int(f.read().strip())
     except Exception:
         return 1
 
-def save_counter(value: int):
+
+def save_counter(value: int) -> None:
     with open(COUNTER_FILE, "w", encoding="utf-8") as f:
         f.write(str(value))
 
+
 REQUEST_COUNTER = load_counter()
 
-# ----------------- MEDIA GROUP -----------------
+# ----------------- MEDIA GROUP (ALBUMS) -----------------
 MEDIA_GROUP_DELAY_SEC = 2.5
 MEDIA_GROUP_BUFFER = {}  # media_group_id -> {items, has_mention, meta, timer}
 
+
 # ----------------- HELPERS -----------------
 def get_message_content(message):
+    """Текст або підпис (caption)"""
     if message.text:
         return message.text
     if message.caption:
         return message.caption
     return None
 
+
 def build_message_link(message):
+    """Спроба зібрати URL на повідомлення (працює для public username та супер-груп -100...)"""
     chat = message.chat
     if chat.username:
         return f"https://t.me/{chat.username}/{message.message_id}"
+
     chat_id_str = str(chat.id)
     if chat_id_str.startswith("-100"):
         return f"https://t.me/c/{chat_id_str[4:]}/{message.message_id}"
+
     return "Посилання недоступне"
+
 
 def make_meta(message):
     chat_title = message.chat.title or "Без назви"
@@ -91,7 +100,8 @@ def make_meta(message):
         "link_text": build_message_link(message),
     }
 
-def build_header(meta, number):
+
+def build_header(meta, number: int) -> str:
     return (
         f"<b>🧨 Запит на опрацювання №{number}</b>\n"
         f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
@@ -100,37 +110,89 @@ def build_header(meta, number):
         f"<b>🔗 Посилання:</b> {meta['link_text']}"
     )
 
+
+def album_to_input_media(items):
+    """Конвертує зібрані повідомлення альбому у список InputMedia* для sendMediaGroup"""
+    media = []
+    for m in items:
+        if m.photo:
+            # найякісніший варіант фото
+            file_id = m.photo[-1].file_id
+            media.append(InputMediaPhoto(media=file_id))
+        elif m.video:
+            media.append(InputMediaVideo(media=m.video.file_id))
+        elif m.document:
+            media.append(InputMediaDocument(media=m.document.file_id))
+    return media
+
+
 def flush_media_group(media_group_id, context):
+    """Відправляє header + альбом одним постом (sendMediaGroup), інкрементує лічильник 1 раз."""
     global REQUEST_COUNTER
 
     bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
-    if not bucket or not bucket["has_mention"]:
+    if not bucket:
         return
 
     try:
-        bucket["timer"].cancel()
+        t = bucket.get("timer")
+        if t:
+            t.cancel()
     except Exception:
         pass
+
+    if not bucket.get("has_mention") or not bucket.get("meta"):
+        logger.info("Альбом %s: згадки нема — не пересилаю", media_group_id)
+        return
 
     number = REQUEST_COUNTER
     meta = bucket["meta"]
     items = sorted(bucket["items"], key=lambda m: m.message_id)
 
+    # 1) Header
     try:
         context.bot.send_message(
             chat_id=FORWARD_CHAT_ID,
             text=build_header(meta, number),
             parse_mode="HTML",
         )
-        for m in items:
-            m.forward(chat_id=FORWARD_CHAT_ID)
+    except Exception as e:
+        logger.exception("❌ Не зміг відправити header для альбому %s: %s", media_group_id, e)
+        return
 
+    # 2) Альбом одним постом
+    media = album_to_input_media(items)
+
+    try:
+        if not media:
+            # fallback
+            logger.info("Альбом %s: нема медіа для sendMediaGroup, fallback на forward", media_group_id)
+            for m in items:
+                m.forward(chat_id=FORWARD_CHAT_ID)
+        else:
+            # Telegram: максимум 10 медіа в одному sendMediaGroup
+            for i in range(0, len(media), 10):
+                context.bot.send_media_group(
+                    chat_id=FORWARD_CHAT_ID,
+                    media=media[i:i + 10],
+                )
+
+        # 3) Counter (1 раз на альбом)
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
+        logger.info("✅ Запит №%s (альбом одним постом) відправлено", number)
 
-        logger.info("✅ Запит №%s (альбом) переслано", number)
     except Exception as e:
-        logger.exception("❌ Помилка альбому: %s", e)
+        logger.exception("❌ send_media_group впав для альбому %s: %s. Fallback на forward.", media_group_id, e)
+        try:
+            for m in items:
+                m.forward(chat_id=FORWARD_CHAT_ID)
+            REQUEST_COUNTER += 1
+            save_counter(REQUEST_COUNTER)
+            logger.info("✅ Запит №%s (fallback forward) відправлено", number)
+        except Exception as e2:
+            logger.exception("❌ Навіть fallback forward не вдався: %s", e2)
+
 
 # ----------------- HANDLER -----------------
 def check_mentions(update, context):
@@ -144,16 +206,32 @@ def check_mentions(update, context):
     if ALLOWED_GROUP_IDS and chat.id not in ALLOWED_GROUP_IDS:
         return
 
-    content = get_message_content(message)
-    has_mention = bool(content) and f"@{USERNAME}" in content
     media_group_id = getattr(message, "media_group_id", None)
+
+    # Логи — щоб бачити, що бот реально отримує
+    logger.info(
+        "Update: chat_id=%s msg_id=%s text=%s caption=%s photo=%s video=%s doc=%s media_group_id=%s",
+        chat.id,
+        getattr(message, "message_id", None),
+        bool(message.text),
+        bool(message.caption),
+        bool(message.photo),
+        bool(message.video),
+        bool(message.document),
+        media_group_id,
+    )
+
+    content = get_message_content(message)
+    has_mention = bool(content) and (f"@{USERNAME}" in content)
 
     # ---- ALBUM ----
     if media_group_id:
         bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
+
         if not bucket:
             bucket = {"items": [], "has_mention": False, "meta": None, "timer": None}
             MEDIA_GROUP_BUFFER[media_group_id] = bucket
+
             t = threading.Timer(MEDIA_GROUP_DELAY_SEC, flush_media_group, args=(media_group_id, context))
             t.daemon = True
             bucket["timer"] = t
@@ -164,6 +242,7 @@ def check_mentions(update, context):
         if has_mention and not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
+            logger.info("🔥 Згадка знайдена в альбомі %s", media_group_id)
 
         return
 
@@ -175,35 +254,45 @@ def check_mentions(update, context):
     meta = make_meta(message)
 
     try:
+        # 1) header
         context.bot.send_message(
             chat_id=FORWARD_CHAT_ID,
             text=build_header(meta, number),
             parse_mode="HTML",
         )
+
+        # 2) пересилаємо саме повідомлення (текст/одиночне фото/відео/док)
         message.forward(chat_id=FORWARD_CHAT_ID)
 
+        # 3) counter
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
 
         logger.info("✅ Запит №%s переслано", number)
+
     except Exception as e:
-        logger.exception("❌ Помилка: %s", e)
+        logger.exception("❌ Помилка при пересиланні: %s", e)
+
 
 # ----------------- RUN -----------------
 def main():
-    logger.info("Бот запущено | старт з №%s", REQUEST_COUNTER)
+    logger.info("Бот запущено | USERNAME=@%s | старт з №%s", USERNAME, REQUEST_COUNTER)
+
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
+
+    # Важливо: ловимо і текст, і caption, і медіа без caption (для елементів альбому)
     dp.add_handler(
         MessageHandler(
             (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
-            check_mentions
+            check_mentions,
         )
     )
+
     updater.start_polling()
     updater.idle()
 
+
 if __name__ == "__main__":
     main()
-
 
