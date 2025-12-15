@@ -59,12 +59,24 @@ def build_message_link(message):
 
 # ----------------- ОСНОВНА ЛОГІКА -----------------
 
+def get_message_text(message):
+    # текст звичайного повідомлення
+    if message.text:
+        return message.text
+    # підпис до фото/відео/документу
+    if message.caption:
+        return message.caption
+    return None
 
 def check_mentions(update, context):
     message = update.message
 
     # Немає повідомлення або тексту — нічого не робимо
-    if not message or not message.text:
+    content = get_message_text(message)
+    if not content:
+        return
+
+    if f"@{USERNAME}" not in content:
         return
 
     # Якщо ALLOWED_GROUP_IDS заданий — фільтруємо за групами
@@ -136,7 +148,7 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, check_mentions))
+   dp.add_handler(MessageHandler((Filters.text | Filters.caption) & ~Filters.command, check_mentions))
 
     updater.start_polling()
     updater.idle()
@@ -145,3 +157,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
