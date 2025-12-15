@@ -26,7 +26,7 @@ ALLOWED_GROUP_IDS_ENV = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if ALLOWED_GROUP_IDS_ENV:
     ALLOWED_GROUP_IDS = {int(x.strip()) for x in ALLOWED_GROUP_IDS_ENV.split(",") if x.strip()}
 else:
-    ALLOWED_GROUP_IDS = set()  # пусто = слушаем все группы
+    ALLOWED_GROUP_IDS = set()  # пусто = слухаємо всі групи
 
 # ----------------- COUNTER (GLOBAL) -----------------
 COUNTER_FILE = "counter.txt"
@@ -58,7 +58,7 @@ def escape_html(s: str) -> str:
 
 
 def get_message_content(message):
-    """Возвращает text или caption."""
+    """Повертає text або caption."""
     if message.text:
         return message.text
     if message.caption:
@@ -67,7 +67,7 @@ def get_message_content(message):
 
 
 def build_message_link(message):
-    """URL на сообщение (если возможно)."""
+    """URL на повідомлення (якщо можливо)."""
     chat = message.chat
     if chat.username:
         return f"https://t.me/{chat.username}/{message.message_id}"
@@ -95,20 +95,16 @@ def make_meta(message):
     else:
         time_str = "Невідомий час"
 
-    content = get_message_content(message) or ""
-
     return {
         "chat_title": chat_title,
         "from_name": from_name,
         "from_username": from_username,
         "time_str": time_str,
         "link_text": build_message_link(message),
-        "content": content,
     }
 
 
 def build_header(meta, number: int) -> str:
-    # Чуть аккуратнее визуально + одинаково везде
     return (
         f"<b>🧨 Запит на опрацювання №{number}</b>\n"
         f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
@@ -118,21 +114,8 @@ def build_header(meta, number: int) -> str:
     )
 
 
-def send_text_block(context, text: str):
-    """Красивый блок текста, без дублей."""
-    safe = escape_html(text)
-    if not safe.strip():
-        return
-    context.bot.send_message(
-        chat_id=FORWARD_CHAT_ID,
-        text=f"<b>💬 Текст:</b>\n{safe}",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
 def album_to_input_media(items):
-    """Собираем список InputMedia* для sendMediaGroup."""
+    """Конвертує повідомлення альбому у InputMedia* для sendMediaGroup."""
     media = []
     for m in items:
         if m.photo:
@@ -146,23 +129,23 @@ def album_to_input_media(items):
 
 
 def flush_media_group(media_group_id, context):
-    """Header + текст отдельно + альбом плиткой. Счетчик +1 один раз."""
+    """
+    Альбом:
+    - Header
+    - Текст (caption) як forward (перше повідомлення альбому)
+    - Фото плиткою через sendMediaGroup
+    """
     global REQUEST_COUNTER
 
     bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
-    if not bucket:
+    if not bucket or not bucket.get("has_mention"):
         return
 
     try:
-        t = bucket.get("timer")
-        if t:
-            t.cancel()
+        if bucket.get("timer"):
+            bucket["timer"].cancel()
     except Exception:
         pass
-
-    if not bucket.get("has_mention") or not bucket.get("meta"):
-        logger.info("Album %s: mention not found, skip", media_group_id)
-        return
 
     number = REQUEST_COUNTER
     meta = bucket["meta"]
@@ -176,32 +159,30 @@ def flush_media_group(media_group_id, context):
             parse_mode="HTML",
         )
 
-        # 2) Текст (caption) отдельным сообщением, иначе он потеряется при sendMediaGroup
-        if meta.get("content"):
-            send_text_block(context, meta["content"])
+        # 2) Текст як "переслано": forward першого елемента (там caption)
+        first_message = items[0]
+        if first_message.caption:
+            first_message.forward(chat_id=FORWARD_CHAT_ID)
 
-        # 3) Альбом плиткой
+        # 3) Фото плиткою (без тексту)
         media = album_to_input_media(items)
-
-        if not media:
-            # fallback
-            for m in items:
-                m.forward(chat_id=FORWARD_CHAT_ID)
-        else:
-            # лимит Telegram: 10 медиа за раз
+        if media:
             for i in range(0, len(media), 10):
                 context.bot.send_media_group(
                     chat_id=FORWARD_CHAT_ID,
                     media=media[i:i + 10],
                 )
+        else:
+            # fallback
+            for m in items:
+                m.forward(chat_id=FORWARD_CHAT_ID)
 
-        # 4) Counter
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
-        logger.info("✅ Запит №%s (альбом плиткою) відправлено", number)
+        logger.info("✅ Запит №%s (альбом: текст як forward, фото плиткою)", number)
 
     except Exception as e:
-        logger.exception("❌ Album %s error: %s", media_group_id, e)
+        logger.exception("❌ Помилка альбому %s: %s", media_group_id, e)
 
 
 # ----------------- HANDLER -----------------
@@ -250,7 +231,7 @@ def check_mentions(update, context):
         if has_mention and not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
-            logger.info("🔥 Mention found in album %s", media_group_id)
+            logger.info("🔥 Згадка знайдена в альбомі %s", media_group_id)
 
         return
 
@@ -262,30 +243,23 @@ def check_mentions(update, context):
     meta = make_meta(message)
 
     try:
-        # 1) Header
+        # Header
         context.bot.send_message(
             chat_id=FORWARD_CHAT_ID,
             text=build_header(meta, number),
             parse_mode="HTML",
         )
 
-        is_media = bool(message.photo or message.video or message.document)
+        # Просто текст -> forward (вигляд "переслано")
+        # 1 фото/відео/док -> forward (без змін, як зараз)
+        message.forward(chat_id=FORWARD_CHAT_ID)
 
-        if not is_media:
-            # Чистый текст: шлем один раз красивым блоком, без forward (чтобы не было дубля)
-            if meta.get("content"):
-                send_text_block(context, meta["content"])
-        else:
-            # Медиа: forward (так сохраняется и медиа, и caption)
-            message.forward(chat_id=FORWARD_CHAT_ID)
-
-        # 3) Counter
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
         logger.info("✅ Запит №%s переслано", number)
 
     except Exception as e:
-        logger.exception("❌ Single message error: %s", e)
+        logger.exception("❌ Помилка при пересиланні: %s", e)
 
 
 # ----------------- RUN -----------------
@@ -295,7 +269,7 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # Важно: ловим и текст, и caption, и медиа без caption (чтобы собрать весь альбом)
+    # Важливо: ловимо і текст, і caption, і медіа без caption (для елементів альбому)
     dp.add_handler(
         MessageHandler(
             (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
