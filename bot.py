@@ -72,7 +72,7 @@ def check_mentions(update, context):
     message = update.message
 
     # Немає повідомлення або тексту — нічого не робимо
-    content = get_message_text(message)
+    content = get_message_content(message)
     if not content:
         return
 
@@ -166,6 +166,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
