@@ -110,7 +110,6 @@ def make_meta(message):
 def build_header(meta, number: int) -> str:
     # Чуть аккуратнее визуально + одинаково везде
     return (
-        f"<b>Слуга якості</b>\n"
         f"<b>🧨 Запит на опрацювання №{number}</b>\n"
         f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
         f"<b>🌐 Група:</b> {escape_html(meta['chat_title'])}\n"
@@ -310,5 +309,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
