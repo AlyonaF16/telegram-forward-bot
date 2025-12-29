@@ -3,6 +3,7 @@ import threading
 import logging
 from datetime import timedelta
 
+from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
 from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Updater, MessageHandler, Filters
 
@@ -31,6 +32,16 @@ else:
 # ----------------- COUNTER (GLOBAL) -----------------
 COUNTER_FILE = "counter.txt"
 
+def topic_id(update, context):
+    message = update.message
+    chat = message.chat
+
+    thread_id = getattr(message, "message_thread_id", None)
+    chat_id = chat.id
+
+    # Просто відповідаємо повідомленням у тій же темі
+    text = f"chat_id = {chat_id}\nmessage_thread_id = {thread_id}"
+    message.reply_text(text)
 
 def load_counter() -> int:
     try:
@@ -283,6 +294,8 @@ def main():
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
+    
+    dp.add_handler(CommandHandler("topicid", topic_id))
 
     # Важливо: ловимо і текст, і caption, і медіа без caption (для елементів альбому)
     dp.add_handler(
@@ -298,4 +311,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
