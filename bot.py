@@ -2,10 +2,10 @@ import os
 import threading
 import logging
 from datetime import timedelta
+from typing import Optional
 
-from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
 from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument
-from telegram.ext import Updater, MessageHandler, Filters
+from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
 
 # ----------------- LOGGING -----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -29,19 +29,33 @@ if ALLOWED_GROUP_IDS_ENV:
 else:
     ALLOWED_GROUP_IDS = set()  # пусто = слухаємо всі групи
 
+# ----------------- ROUTING BY TOPICS -----------------
+# FORMAT env: ROUTES="-100group1:thread1,-100group2:thread2"
+ROUTES_ENV = os.getenv("ROUTES", "").strip()
+ROUTES = {}  # source_chat_id -> message_thread_id
+
+if ROUTES_ENV:
+    for pair in ROUTES_ENV.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        try:
+            src_str, thread_str = pair.split(":")
+            src_id = int(src_str.strip())
+            thread_id = int(thread_str.strip())
+            ROUTES[src_id] = thread_id
+        except ValueError:
+            logger.warning("Невірний формат ROUTES пари: %s", pair)
+
+
+def get_thread_id_for_chat(chat_id: int) -> Optional[int]:
+    """Яку тему використовувати для цього джерела."""
+    return ROUTES.get(chat_id)
+
+
 # ----------------- COUNTER (GLOBAL) -----------------
 COUNTER_FILE = "counter.txt"
 
-def topic_id(update, context):
-    message = update.message
-    chat = message.chat
-
-    thread_id = getattr(message, "message_thread_id", None)
-    chat_id = chat.id
-
-    # Просто відповідаємо повідомленням у тій же темі
-    text = f"chat_id = {chat_id}\nmessage_thread_id = {thread_id}"
-    message.reply_text(text)
 
 def load_counter() -> int:
     try:
@@ -60,7 +74,7 @@ REQUEST_COUNTER = load_counter()
 
 # ----------------- MEDIA GROUP (ALBUMS) -----------------
 MEDIA_GROUP_DELAY_SEC = 2.5
-# media_group_id -> {items, has_mention, meta, timer, mention_msg_id}
+# media_group_id -> {items, has_mention, meta, timer, mention_text}
 MEDIA_GROUP_BUFFER = {}
 
 # ----------------- HELPERS -----------------
@@ -112,6 +126,7 @@ def make_meta(message):
         "from_username": from_username,
         "time_str": time_str,
         "link_text": build_message_link(message),
+        "chat_id": message.chat.id,
     }
 
 
@@ -139,12 +154,33 @@ def album_to_input_media(items):
     return media
 
 
+def send_album_text_only(context, meta, text: str, thread_id: Optional[int]):
+    """Тільки текст (копія caption) без фото."""
+    if not text or not text.strip():
+        return
+
+    safe_text = escape_html(text)
+    prefix = f"Переслано від {escape_html(meta['from_name'])} {escape_html(meta['from_username'])}".strip()
+    body = f"<i>{prefix}</i>\n{safe_text}"
+
+    kwargs = {
+        "chat_id": FORWARD_CHAT_ID,
+        "text": body,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if thread_id is not None:
+        kwargs["message_thread_id"] = thread_id
+
+    context.bot.send_message(**kwargs)
+
+
 def flush_media_group(media_group_id, context):
     """
     Альбом:
-    - Header
-    - Текст як "переслано" (forward повідомлення, де був тег/текст)
-    - Фото плиткою (sendMediaGroup), але БЕЗ дубля — виключаємо форварднуте повідомлення
+    - Header у потрібну тему (якщо налаштована)
+    - Текст окремо (без фото) у ту ж тему
+    - ВСІ фото плиткою у ту ж тему
     """
     global REQUEST_COUNTER
 
@@ -160,51 +196,70 @@ def flush_media_group(media_group_id, context):
 
     number = REQUEST_COUNTER
     meta = bucket["meta"]
-    mention_msg_id = bucket.get("mention_msg_id")
+    mention_text = bucket.get("mention_text") or ""
     items = sorted(bucket["items"], key=lambda m: m.message_id)
+
+    thread_id = get_thread_id_for_chat(meta["chat_id"])
 
     try:
         # 1) Header
-        context.bot.send_message(
-            chat_id=FORWARD_CHAT_ID,
-            text=build_header(meta, number),
-            parse_mode="HTML",
-        )
+        kwargs_header = {
+            "chat_id": FORWARD_CHAT_ID,
+            "text": build_header(meta, number),
+            "parse_mode": "HTML",
+        }
+        if thread_id is not None:
+            kwargs_header["message_thread_id"] = thread_id
 
-        # 2) Forward "текстового" елемента альбому (той, де був тег)
-        forwarded_message = None
-        if mention_msg_id:
-            for m in items:
-                if m.message_id == mention_msg_id:
-                    forwarded_message = m
-                    break
-        if not forwarded_message:
-            forwarded_message = items[0]
+        context.bot.send_message(**kwargs_header)
 
-        # forward дає "як переслано" і не губить caption
-        forwarded_message.forward(chat_id=FORWARD_CHAT_ID)
+        # 2) Текст без фото
+        send_album_text_only(context, meta, mention_text, thread_id)
 
-        # 3) Фото плиткою, але БЕЗ дубля: виключаємо forwarded_message
-        remaining_items = [m for m in items if m.message_id != forwarded_message.message_id]
-        media = album_to_input_media(remaining_items)
-
+        # 3) ВСІ фото плиткою
+        media = album_to_input_media(items)
         if media:
             for i in range(0, len(media), 10):
-                context.bot.send_media_group(
-                    chat_id=FORWARD_CHAT_ID,
-                    media=media[i:i + 10],
-                )
-        # якщо залишилося 0 — значить альбом був з 1 елемента (рідко), і все вже форварднулося
+                kwargs_media = {
+                    "chat_id": FORWARD_CHAT_ID,
+                    "media": media[i:i + 10],
+                }
+                if thread_id is not None:
+                    kwargs_media["message_thread_id"] = thread_id
+                context.bot.send_media_group(**kwargs_media)
+        else:
+            # fallback
+            for m in items:
+                kwargs_fwd = {"chat_id": FORWARD_CHAT_ID}
+                if thread_id is not None:
+                    kwargs_fwd["message_thread_id"] = thread_id
+                m.forward(**kwargs_fwd)
 
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
-        logger.info("✅ Запит №%s (альбом без дубля) відправлено", number)
+        logger.info("✅ Запит №%s (альбом: текст окремо, всі фото плиткою) відправлено", number)
 
     except Exception as e:
         logger.exception("❌ Помилка альбому %s: %s", media_group_id, e)
 
 
-# ----------------- HANDLER -----------------
+# ----------------- /topicid командa -----------------
+def topic_id(update, context):
+    """
+    Службова команда: показує chat_id і message_thread_id теми, де її викликали.
+    Використовується, щоб налаштувати ROUTES.
+    """
+    message = update.message
+    chat = message.chat
+
+    thread_id = getattr(message, "message_thread_id", None)
+    chat_id = chat.id
+
+    text = f"chat_id = {chat_id}\nmessage_thread_id = {thread_id}"
+    message.reply_text(text)
+
+
+# ----------------- MAIN HANDLER -----------------
 def check_mentions(update, context):
     global REQUEST_COUNTER
 
@@ -242,7 +297,7 @@ def check_mentions(update, context):
                 "has_mention": False,
                 "meta": None,
                 "timer": None,
-                "mention_msg_id": None,
+                "mention_text": "",
             }
             MEDIA_GROUP_BUFFER[media_group_id] = bucket
 
@@ -256,7 +311,7 @@ def check_mentions(update, context):
         if has_mention and not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
-            bucket["mention_msg_id"] = message.message_id  # запам’ятали, де саме був тег/текст
+            bucket["mention_text"] = content or ""
             logger.info("🔥 Згадка знайдена в альбомі %s (msg_id=%s)", media_group_id, message.message_id)
 
         return
@@ -267,18 +322,25 @@ def check_mentions(update, context):
 
     number = REQUEST_COUNTER
     meta = make_meta(message)
+    thread_id = get_thread_id_for_chat(meta["chat_id"])
 
     try:
         # Header
-        context.bot.send_message(
-            chat_id=FORWARD_CHAT_ID,
-            text=build_header(meta, number),
-            parse_mode="HTML",
-        )
+        kwargs_header = {
+            "chat_id": FORWARD_CHAT_ID,
+            "text": build_header(meta, number),
+            "parse_mode": "HTML",
+        }
+        if thread_id is not None:
+            kwargs_header["message_thread_id"] = thread_id
 
-        # Текст -> forward (як переслано)
-        # 1 фото/відео/док -> forward (без змін)
-        message.forward(chat_id=FORWARD_CHAT_ID)
+        context.bot.send_message(**kwargs_header)
+
+        # SINGLE: forward як є (текст / 1 фото / відео / документ)
+        kwargs_fwd = {"chat_id": FORWARD_CHAT_ID}
+        if thread_id is not None:
+            kwargs_fwd["message_thread_id"] = thread_id
+        message.forward(**kwargs_fwd)
 
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
@@ -290,14 +352,15 @@ def check_mentions(update, context):
 
 # ----------------- RUN -----------------
 def main():
-    logger.info("Bot started | USERNAME=@%s | start counter=%s", USERNAME, REQUEST_COUNTER)
+    logger.info("Bot started | USERNAME=@%s | start counter=%s | ROUTES=%s", USERNAME, REQUEST_COUNTER, ROUTES)
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
-    
+
+    # команда для отримання message_thread_id теми
     dp.add_handler(CommandHandler("topicid", topic_id))
 
-    # Важливо: ловимо і текст, і caption, і медіа без caption (для елементів альбому)
+    # основний хендлер згадок
     dp.add_handler(
         MessageHandler(
             (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
