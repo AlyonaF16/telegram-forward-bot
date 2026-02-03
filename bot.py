@@ -4,24 +4,33 @@ import threading
 import logging
 import json
 import time
-import hashlib
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
 from telegram.error import ChatMigrated
 
+
 # ----------------- LOGGING -----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("mentions-bot")
+
+
+# ----------------- DATA DIR (Render Disk) -----------------
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+COUNTER_FILE = os.path.join(DATA_DIR, "counter.txt")
+PROCESSED_FILE = os.path.join(DATA_DIR, "processed_mentions.json")
+STATE_FILE = os.path.join(DATA_DIR, "seen_state.json")
+ALBUM_FILE = os.path.join(DATA_DIR, "album_store.json")
+FORWARD_CHAT_ID_FILE = os.path.join(DATA_DIR, "forward_chat_id.txt")
+
 
 # ----------------- ENV -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-USERNAME = os.getenv("USERNAME", "help_quality")  # без @
+USERNAME = os.getenv("USERNAME", "help_quality").lstrip("@")  # без @
 FORWARD_CHAT_ID_ENV = os.getenv("FORWARD_CHAT_ID")
 
 if not BOT_TOKEN:
@@ -29,37 +38,36 @@ if not BOT_TOKEN:
 if not FORWARD_CHAT_ID_ENV:
     raise RuntimeError("FORWARD_CHAT_ID не задано в ENV")
 
-# Optional: allowlist для исходных групп
+# Сколько держим память, чтобы ловить добавление тега через часы
+STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "28800"))  # 8 часов
+
+# Optional allowlist групп
 ALLOWED_GROUP_IDS_ENV = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if ALLOWED_GROUP_IDS_ENV:
     ALLOWED_GROUP_IDS = {int(x.strip()) for x in ALLOWED_GROUP_IDS_ENV.split(",") if x.strip()}
 else:
     ALLOWED_GROUP_IDS = set()  # пусто = слушаем все группы
 
-# ----------------- ROUTING BY TOPICS -----------------
-# FORMAT env: ROUTES="-100group1:thread1,-100group2:thread2"
+# ROUTES env: "-100src1:thread1,-100src2:thread2"
 ROUTES_ENV = os.getenv("ROUTES", "").strip()
-ROUTES: dict[int, int] = {}
-
+ROUTES: Dict[int, int] = {}
 if ROUTES_ENV:
     for pair in ROUTES_ENV.split(","):
         pair = pair.strip()
         if not pair:
             continue
         try:
-            src_str, thread_str = pair.split(":")
-            ROUTES[int(src_str.strip())] = int(thread_str.strip())
+            src_str, thr_str = pair.split(":")
+            ROUTES[int(src_str.strip())] = int(thr_str.strip())
         except ValueError:
-            logger.warning("Невірний формат ROUTES пари: %s", pair)
+            logger.warning("Неверный формат ROUTES пары: %s", pair)
 
 
 def get_thread_id_for_chat(chat_id: int) -> Optional[int]:
     return ROUTES.get(chat_id)
 
+
 # ----------------- COUNTER -----------------
-COUNTER_FILE = "counter.txt"
-
-
 def load_counter() -> int:
     try:
         with open(COUNTER_FILE, "r", encoding="utf-8") as f:
@@ -68,35 +76,29 @@ def load_counter() -> int:
         return 1
 
 
-def save_counter(value: int) -> None:
+def save_counter(val: int) -> None:
     with open(COUNTER_FILE, "w", encoding="utf-8") as f:
-        f.write(str(value))
+        f.write(str(val))
 
 
 REQUEST_COUNTER = load_counter()
 
-# ----------------- FORWARD CHAT ID PERSISTENCE -----------------
-FORWARD_CHAT_ID_FILE = "forward_chat_id.txt"
 
-
-def save_forward_chat_id(value: int) -> None:
+# ----------------- FORWARD CHAT ID (migration-safe) -----------------
+def save_forward_chat_id(val: int) -> None:
     with open(FORWARD_CHAT_ID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(value))
-    logger.info("Оновив FORWARD_CHAT_ID у файлі: %s", value)
+        f.write(str(val))
+    logger.info("Saved FORWARD_CHAT_ID=%s", val)
 
 
 def load_forward_chat_id() -> int:
     if os.path.exists(FORWARD_CHAT_ID_FILE):
         try:
             with open(FORWARD_CHAT_ID_FILE, "r", encoding="utf-8") as f:
-                val = int(f.read().strip())
-                logger.info("Завантажив FORWARD_CHAT_ID з файлу: %s", val)
-                return val
-        except Exception as e:
-            logger.warning("Не вдалося прочитати forward_chat_id.txt: %s", e)
-
+                return int(f.read().strip())
+        except Exception:
+            pass
     val = int(FORWARD_CHAT_ID_ENV)
-    logger.info("Використовую FORWARD_CHAT_ID з ENV: %s", val)
     save_forward_chat_id(val)
     return val
 
@@ -109,62 +111,77 @@ def send_with_migration_retry(func, *, chat_id: int, **kwargs):
     try:
         return func(chat_id=chat_id, **kwargs)
     except ChatMigrated as e:
-        new_id = e.new_chat_id
-        logger.warning("Цільова група мігрувала. Новий chat_id = %s", new_id)
-        FORWARD_CHAT_ID = new_id
-        save_forward_chat_id(new_id)
-        return func(chat_id=new_id, **kwargs)
-
-# ----------------- EVENT DEDUP -----------------
-DEDUP_FILE = "dedupe.json"
-DEDUP_TTL_SEC = 7 * 24 * 60 * 60
-_dedup_cache = None
+        FORWARD_CHAT_ID = e.new_chat_id
+        save_forward_chat_id(FORWARD_CHAT_ID)
+        return func(chat_id=FORWARD_CHAT_ID, **kwargs)
 
 
-def _load_dedup():
-    global _dedup_cache
-    if _dedup_cache is not None:
-        return _dedup_cache
-    try:
-        with open(DEDUP_FILE, "r", encoding="utf-8") as f:
-            _dedup_cache = json.load(f)
-    except Exception:
-        _dedup_cache = {}
-    return _dedup_cache
+# ----------------- HELPERS -----------------
+def escape_html(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _save_dedup(data):
-    with open(DEDUP_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+def get_message_content(message) -> str:
+    if message.text:
+        return message.text
+    if message.caption:
+        return message.caption
+    return ""
 
 
-def _prune_dedup(data, now_ts: int):
-    dead = [k for k, ts in data.items() if (now_ts - int(ts)) > DEDUP_TTL_SEC]
-    for k in dead:
-        data.pop(k, None)
+def has_tag(text: str) -> bool:
+    return f"@{USERNAME}" in (text or "")
 
 
-def _mk_hash(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
+def build_message_link(message) -> str:
+    chat = message.chat
+    if chat.username:
+        return f"https://t.me/{chat.username}/{message.message_id}"
+    chat_id_str = str(chat.id)
+    if chat_id_str.startswith("-100"):
+        return f"https://t.me/c/{chat_id_str[4:]}/{message.message_id}"
+    return "Посилання недоступне"
 
 
-def is_duplicate_event(event_key: str) -> bool:
-    now_ts = int(time.time())
-    data = _load_dedup()
-    _prune_dedup(data, now_ts)
-    if event_key in data:
-        return True
-    data[event_key] = now_ts
-    _save_dedup(data)
-    return False
+def make_meta(message) -> Dict[str, Any]:
+    chat_title = message.chat.title or "Без назви"
+    user = message.from_user
+    if user:
+        from_name = f"{user.first_name} {user.last_name}".strip() if user.last_name else user.first_name
+        from_username = f"@{user.username}" if user.username else ""
+    else:
+        from_name = "Невідомий користувач"
+        from_username = ""
+    time_str = (message.date + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S") if message.date else "Невідомий час"
+    return {
+        "chat_id": message.chat.id,
+        "chat_title": chat_title,
+        "from_name": from_name,
+        "from_username": from_username,
+        "time_str": time_str,
+        "link_text": build_message_link(message),
+    }
 
-# ----------------- PROCESSED MENTIONS -----------------
-# Одне повідомлення (або альбом) -> один запит.
-PROCESSED_FILE = "processed_mentions.json"
+
+def build_header(meta: Dict[str, Any], number: int) -> str:
+    return (
+        f"<b>🧨 Запит на опрацювання №{number}</b>\n"
+        f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
+        f"<b>🌐 Група:</b> {escape_html(meta['chat_title'])}\n"
+        f"<b>🐈‍⬛ Хто тегнув:</b> {escape_html(meta['from_name'])} {escape_html(meta['from_username'])}\n"
+        f"<b>🔗 Посилання:</b> {escape_html(meta['link_text'])}"
+    )
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+# ----------------- PROCESSED (anti-duplicate sends) -----------------
 _processed_cache = None
 
 
-def load_processed():
+def load_processed() -> Dict[str, int]:
     global _processed_cache
     if _processed_cache is not None:
         return _processed_cache
@@ -176,107 +193,187 @@ def load_processed():
     return _processed_cache
 
 
-def save_processed(data):
+def save_processed(data: Dict[str, int]) -> None:
     with open(PROCESSED_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
 
-def was_processed(chat_id: int, message_id: int) -> bool:
-    data = load_processed()
-    return f"{chat_id}:{message_id}" in data
+def is_processed(key: str) -> bool:
+    return key in load_processed()
 
 
-def mark_processed(chat_id: int, message_id: int):
+def mark_processed_key(key: str) -> None:
     data = load_processed()
-    data[f"{chat_id}:{message_id}"] = int(time.time())
+    data[key] = now_ts()
     save_processed(data)
 
-# ----------------- MEDIA GROUP (ALBUMS) -----------------
-MEDIA_GROUP_DELAY_SEC = float(os.getenv("MEDIA_GROUP_DELAY_SEC", "2.8"))
 
-# active buffer while album is arriving
-MEDIA_GROUP_BUFFER: dict[str, dict] = {}
-
-# archive for albums without mention (so edit later can trigger)
-ALBUM_ARCHIVE_TTL_SEC = int(os.getenv("ALBUM_ARCHIVE_TTL_SEC", "3600"))  # 1 hour default
-ALBUM_ARCHIVE: dict[str, dict] = {}  # media_group_id -> {items, ts}
+# ----------------- STATE for SINGLE (had_mention before?) -----------------
+_state_cache = None
 
 
-def prune_album_archive():
-    now = time.time()
-    dead = [k for k, v in ALBUM_ARCHIVE.items() if (now - float(v.get("ts", now))) > ALBUM_ARCHIVE_TTL_SEC]
+def load_state() -> Dict[str, Dict[str, Any]]:
+    global _state_cache
+    if _state_cache is not None:
+        return _state_cache
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            _state_cache = json.load(f)
+    except Exception:
+        _state_cache = {}
+    return _state_cache
+
+
+def save_state(data: Dict[str, Dict[str, Any]]) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def prune_state() -> None:
+    data = load_state()
+    t = now_ts()
+    dead = [k for k, v in data.items() if (t - int(v.get("ts", t))) > STATE_TTL_SEC]
     for k in dead:
-        ALBUM_ARCHIVE.pop(k, None)
+        data.pop(k, None)
+    if dead:
+        save_state(data)
 
 
-# ----------------- HELPERS -----------------
-def escape_html(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def state_key_for_message(chat_id: int, message_id: int) -> str:
+    return f"MSG:{chat_id}:{message_id}"
 
 
-def get_message_content(message):
-    if message.text:
-        return message.text
-    if message.caption:
-        return message.caption
-    return ""
+def set_seen_state(chat_id: int, message_id: int, had_mention: bool) -> None:
+    prune_state()
+    data = load_state()
+    data[state_key_for_message(chat_id, message_id)] = {"ts": now_ts(), "had_mention": bool(had_mention)}
+    save_state(data)
 
 
-def build_message_link(message):
-    chat = message.chat
-    if chat.username:
-        return f"https://t.me/{chat.username}/{message.message_id}"
-    chat_id_str = str(chat.id)
-    if chat_id_str.startswith("-100"):
-        return f"https://t.me/c/{chat_id_str[4:]}/{message.message_id}"
-    return "Посилання недоступне"
+def get_seen_state(chat_id: int, message_id: int) -> Optional[Dict[str, Any]]:
+    prune_state()
+    return load_state().get(state_key_for_message(chat_id, message_id))
 
 
-def make_meta(message):
-    chat_title = message.chat.title or "Без назви"
-    user = message.from_user
-    if user:
-        from_name = f"{user.first_name} {user.last_name}".strip() if user.last_name else user.first_name
-        from_username = f"@{user.username}" if user.username else ""
-    else:
-        from_name = "Невідомий користувач"
-        from_username = ""
-    time_str = (message.date + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S") if message.date else "Невідомий час"
-    return {
-        "chat_title": chat_title,
-        "from_name": from_name,
-        "from_username": from_username,
-        "time_str": time_str,
-        "link_text": build_message_link(message),
-        "chat_id": message.chat.id,
-    }
+# ----------------- ALBUM STORE (file_id list for later) -----------------
+_album_cache = None
 
 
-def build_header(meta, number: int) -> str:
-    return (
-        f"<b>🧨 Запит на опрацювання №{number}</b>\n"
-        f"<b>🕓 Дата й час:</b> {meta['time_str']}\n"
-        f"<b>🌐 Група:</b> {escape_html(meta['chat_title'])}\n"
-        f"<b>🐈‍⬛ Хто тегнув:</b> {escape_html(meta['from_name'])} {escape_html(meta['from_username'])}\n"
-        f"<b>🔗 Посилання:</b> {escape_html(meta['link_text'])}"
-    )
+def load_albums() -> Dict[str, Dict[str, Any]]:
+    global _album_cache
+    if _album_cache is not None:
+        return _album_cache
+    try:
+        with open(ALBUM_FILE, "r", encoding="utf-8") as f:
+            _album_cache = json.load(f)
+    except Exception:
+        _album_cache = {}
+    return _album_cache
 
 
-def album_to_input_media(items):
+def save_albums(data: Dict[str, Dict[str, Any]]) -> None:
+    with open(ALBUM_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def prune_albums() -> None:
+    data = load_albums()
+    t = now_ts()
+    dead = [k for k, v in data.items() if (t - int(v.get("ts", t))) > STATE_TTL_SEC]
+    for k in dead:
+        data.pop(k, None)
+    if dead:
+        save_albums(data)
+
+
+def album_key(chat_id: int, media_group_id: str) -> str:
+    return f"ALB:{chat_id}:{media_group_id}"
+
+
+def add_album_media(chat_id: int, media_group_id: str, message) -> None:
+    prune_albums()
+    data = load_albums()
+    key = album_key(chat_id, str(media_group_id))
+
+    rec = data.get(key) or {"ts": now_ts(), "items": [], "had_mention": False, "mention_text": "", "meta": None}
+    rec["ts"] = now_ts()
+
+    if message.photo:
+        rec["items"].append({"type": "photo", "file_id": message.photo[-1].file_id})
+    elif message.video:
+        rec["items"].append({"type": "video", "file_id": message.video.file_id})
+    elif message.document:
+        rec["items"].append({"type": "document", "file_id": message.document.file_id})
+
+    data[key] = rec
+    save_albums(data)
+
+
+def set_album_state(chat_id: int, media_group_id: str, had_mention: bool, mention_text: str, meta: Dict[str, Any]) -> None:
+    prune_albums()
+    data = load_albums()
+    key = album_key(chat_id, str(media_group_id))
+    rec = data.get(key) or {"ts": now_ts(), "items": [], "had_mention": False, "mention_text": "", "meta": None}
+
+    rec["ts"] = now_ts()
+    rec["had_mention"] = bool(had_mention)
+    rec["mention_text"] = mention_text or rec.get("mention_text", "")
+    rec["meta"] = meta or rec.get("meta")
+
+    data[key] = rec
+    save_albums(data)
+
+
+def get_album(chat_id: int, media_group_id: str) -> Optional[Dict[str, Any]]:
+    prune_albums()
+    return load_albums().get(album_key(chat_id, str(media_group_id)))
+
+
+def build_media_group_from_album(items: List[Dict[str, str]]):
     media = []
-    for m in items:
-        if m.photo:
-            media.append(InputMediaPhoto(media=m.photo[-1].file_id))
-        elif m.video:
-            media.append(InputMediaVideo(media=m.video.file_id))
-        elif m.document:
-            media.append(InputMediaDocument(media=m.document.file_id))
+    for it in items:
+        t = it.get("type")
+        fid = it.get("file_id")
+        if not fid:
+            continue
+        if t == "photo":
+            media.append(InputMediaPhoto(media=fid))
+        elif t == "video":
+            media.append(InputMediaVideo(media=fid))
+        elif t == "document":
+            media.append(InputMediaDocument(media=fid))
     return media
 
 
-def send_album_text_only(context, meta, text: str, thread_id: Optional[int]):
-    text = text or ""
-    if not text.strip():
+# ----------------- ALBUM timer (optional) -----------------
+MEDIA_GROUP_DELAY_SEC = float(os.getenv("MEDIA_GROUP_DELAY_SEC", "2.8"))
+MEDIA_GROUP_BUFFER: Dict[str, Dict[str, Any]] = {}
+
+
+def flush_album(media_group_id: str, context):
+    MEDIA_GROUP_BUFFER.pop(str(media_group_id), None)
+
+
+def ensure_album_timer(media_group_id: str, context):
+    mg = str(media_group_id)
+    if mg in MEDIA_GROUP_BUFFER:
+        return
+    t = threading.Timer(MEDIA_GROUP_DELAY_SEC, flush_album, args=(mg, context))
+    t.daemon = True
+    MEDIA_GROUP_BUFFER[mg] = {"timer": t}
+    t.start()
+
+
+# ----------------- SENDERS -----------------
+def send_header(context, meta: Dict[str, Any], number: int, thread_id: Optional[int]):
+    kwargs = {"text": build_header(meta, number), "parse_mode": "HTML"}
+    if thread_id is not None:
+        kwargs["message_thread_id"] = thread_id
+    send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs)
+
+
+def send_text_only_like_forward(context, meta: Dict[str, Any], text: str, thread_id: Optional[int]):
+    if not (text or "").strip():
         return
     prefix = f"Переслано від {escape_html(meta['from_name'])} {escape_html(meta['from_username'])}".strip()
     body = f"<i>{prefix}</i>\n{escape_html(text)}"
@@ -286,106 +383,72 @@ def send_album_text_only(context, meta, text: str, thread_id: Optional[int]):
     send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs)
 
 
-def send_album_bundle(context, *, meta, mention_text, items, media_group_id: str):
-    """Send: header + text-only + media group (all items), mark processed."""
-    global REQUEST_COUNTER
-
-    items = sorted(items, key=lambda m: m.message_id)
-    if not items:
+def send_album(context, chat_id: int, media_group_id: str, number: int):
+    alb = get_album(chat_id, media_group_id)
+    if not alb:
+        logger.warning("Album not found in store chat=%s mg=%s", chat_id, media_group_id)
         return
 
-    # If already processed album (first msg) -> stop
-    if was_processed(meta["chat_id"], items[0].message_id):
-        logger.info("⏭ Альбом вже оброблений (chat=%s msg=%s)", meta["chat_id"], items[0].message_id)
+    meta = alb.get("meta")
+    items = alb.get("items") or []
+    mention_text = alb.get("mention_text") or ""
+
+    if not meta or not items:
+        logger.warning("Album store incomplete chat=%s mg=%s meta=%s items=%s", chat_id, media_group_id, bool(meta), len(items))
         return
 
-    # Dedup by album event
-    event_key = f"ALBUM_EVT:{meta['chat_id']}:{media_group_id}:{_mk_hash(mention_text)}"
-    if is_duplicate_event(event_key):
-        logger.info("⏭ Пропуск дубля ALBUM_EVT: %s", event_key)
+    thread_id = get_thread_id_for_chat(chat_id)
+
+    pkey = f"ALBUM_SENT:{chat_id}:{media_group_id}"
+    if is_processed(pkey):
+        logger.info("Skip already sent album %s", pkey)
         return
 
-    number = REQUEST_COUNTER
-    thread_id = get_thread_id_for_chat(meta["chat_id"])
+    send_header(context, meta, number, thread_id)
+    send_text_only_like_forward(context, meta, mention_text, thread_id)
 
-    # 1) header
-    kwargs_header = {"text": build_header(meta, number), "parse_mode": "HTML"}
-    if thread_id is not None:
-        kwargs_header["message_thread_id"] = thread_id
-    send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
-
-    # 2) text only
-    send_album_text_only(context, meta, mention_text, thread_id)
-
-    # 3) media плиткой
-    media = album_to_input_media(items)
+    media = build_media_group_from_album(items)
     if media:
         for i in range(0, len(media), 10):
-            kwargs_media = {"media": media[i:i + 10]}
+            kwargs = {"media": media[i:i + 10]}
             if thread_id is not None:
-                kwargs_media["message_thread_id"] = thread_id
-            send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs_media)
-    else:
-        # fallback
-        for m in items:
-            kwargs_fwd = {}
-            if thread_id is not None:
-                kwargs_fwd["message_thread_id"] = thread_id
-            send_with_migration_retry(m.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
+                kwargs["message_thread_id"] = thread_id
+            send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs)
 
-    # mark processed for whole album
-    for m in items:
-        mark_processed(meta["chat_id"], m.message_id)
-
-    REQUEST_COUNTER += 1
-    save_counter(REQUEST_COUNTER)
-    logger.info("✅ Запит №%s (album) відправлено, items=%s", number, len(items))
+    mark_processed_key(pkey)
 
 
-def flush_media_group(media_group_id, context):
-    """Finish receiving album. If no mention -> move to archive. If mention -> send."""
-    bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
-    if not bucket:
+def send_single_forward(context, message, number: int):
+    meta = make_meta(message)
+    chat_id = meta["chat_id"]
+    thread_id = get_thread_id_for_chat(chat_id)
+
+    pkey = f"MSG_SENT:{chat_id}:{message.message_id}"
+    if is_processed(pkey):
+        logger.info("Skip already sent msg %s", pkey)
         return
 
-    try:
-        if bucket.get("timer"):
-            bucket["timer"].cancel()
-    except Exception:
-        pass
+    send_header(context, meta, number, thread_id)
 
-    items = bucket.get("items", [])
-    has_mention = bucket.get("has_mention", False)
+    kwargs_fwd = {}
+    if thread_id is not None:
+        kwargs_fwd["message_thread_id"] = thread_id
+    send_with_migration_retry(message.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
 
-    # If no mention yet -> archive it (so edit later can trigger)
-    if not has_mention:
-        prune_album_archive()
-        ALBUM_ARCHIVE[media_group_id] = {
-            "items": items,
-            "ts": time.time(),
-        }
-        logger.info("📦 Альбом без тегу збережено в архів: media_group_id=%s items=%s", media_group_id, len(items))
-        return
+    mark_processed_key(pkey)
 
-    # if mention present -> send immediately
-    send_album_bundle(
-        context,
-        meta=bucket["meta"],
-        mention_text=bucket.get("mention_text", ""),
-        items=items,
-        media_group_id=media_group_id,
-    )
 
 # ----------------- /topicid -----------------
 def topic_id(update, context):
     message = update.message or update.edited_message
     if not message:
         return
-    thread_id = getattr(message, "message_thread_id", None)
-    message.reply_text(f"chat_id = {message.chat.id}\nmessage_thread_id = {thread_id}")
+    tid = getattr(message, "message_thread_id", None)
+    message.reply_text(f"chat_id = {message.chat.id}\nmessage_thread_id = {tid}")
+
 
 # ----------------- MAIN HANDLER -----------------
-def check_mentions(update, context):
+def handle(update, context):
     global REQUEST_COUNTER
 
     message = update.message or update.edited_message
@@ -396,123 +459,75 @@ def check_mentions(update, context):
     if ALLOWED_GROUP_IDS and chat.id not in ALLOWED_GROUP_IDS:
         return
 
-    media_group_id = getattr(message, "media_group_id", None)
+    is_edited = bool(update.edited_message)
     content = get_message_content(message)
-    has_mention = (f"@{USERNAME}" in (content or ""))
+    mention_now = has_tag(content)
+    media_group_id = getattr(message, "media_group_id", None)
 
     logger.info(
-        "Update: chat_id=%s msg_id=%s edited=%s media_group_id=%s mention=%s text=%s caption=%s photo=%s video=%s doc=%s",
-        chat.id,
-        getattr(message, "message_id", None),
-        bool(update.edited_message),
-        media_group_id,
-        has_mention,
-        bool(message.text),
-        bool(message.caption),
-        bool(message.photo),
-        bool(message.video),
-        bool(message.document),
+        "Update: chat_id=%s msg_id=%s edited=%s media_group_id=%s mention_now=%s",
+        chat.id, message.message_id, is_edited, media_group_id, mention_now
     )
 
-    # ---- ALBUM ----
-    # ВСЕ элементы альбома буферим всегда (даже если mention=False),
-    # иначе при тегах в caption только у одного фото — мы потеряем остальные.
+    # -------- ALBUM --------
     if media_group_id:
-        bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
-        if not bucket:
-            bucket = {"items": [], "has_mention": False, "meta": None, "timer": None, "mention_text": ""}
-            MEDIA_GROUP_BUFFER[media_group_id] = bucket
+        ensure_album_timer(media_group_id, context)
+        add_album_media(chat.id, str(media_group_id), message)
 
-            t = threading.Timer(MEDIA_GROUP_DELAY_SEC, flush_media_group, args=(media_group_id, context))
-            t.daemon = True
-            bucket["timer"] = t
-            t.start()
+        alb = get_album(chat.id, str(media_group_id))
+        had_mention_before = bool(alb.get("had_mention")) if alb else False
 
-        bucket["items"].append(message)
+        # Отправляем альбом только при первом появлении тега
+        if mention_now and not had_mention_before:
+            meta = make_meta(message)
+            set_album_state(chat.id, str(media_group_id), True, content or "", meta)
 
-        # если тег обнаружили на любом элементе — фиксируем 1 раз
-        if has_mention and not bucket["has_mention"]:
-            bucket["has_mention"] = True
-            bucket["meta"] = make_meta(message)
-            bucket["mention_text"] = content or ""
+            num = REQUEST_COUNTER
+            REQUEST_COUNTER += 1
+            save_counter(REQUEST_COUNTER)
 
-            # Если этот альбом уже успел уйти в ARCHIVE (редактирование спустя время) — достаём и шлём все фото
-            prune_album_archive()
-            archived = ALBUM_ARCHIVE.pop(media_group_id, None)
-            if archived:
-                all_items = (archived.get("items") or []) + bucket["items"]
-                # убираем дубли по message_id
-                uniq = {}
-                for m in all_items:
-                    uniq[m.message_id] = m
-                all_items = list(uniq.values())
-
-                logger.info("📤 Тег додали пізніше. Дістав альбом з архіву: media_group_id=%s total_items=%s",
-                            media_group_id, len(all_items))
-
-                # Отправляем сразу (без ожидания таймера)
-                send_album_bundle(
-                    context,
-                    meta=bucket["meta"],
-                    mention_text=bucket["mention_text"],
-                    items=all_items,
-                    media_group_id=media_group_id,
-                )
-
-                # чистим активный буфер, чтобы таймер не отправил еще раз
-                try:
-                    if bucket.get("timer"):
-                        bucket["timer"].cancel()
-                except Exception:
-                    pass
-                MEDIA_GROUP_BUFFER.pop(media_group_id, None)
+            send_album(context, chat.id, str(media_group_id), num)
+        else:
+            if not had_mention_before:
+                meta = make_meta(message)
+                set_album_state(chat.id, str(media_group_id), False, alb.get("mention_text", "") if alb else "", meta)
 
         return
 
-    # ---- SINGLE ----
-    if not has_mention:
-        return
+    # -------- SINGLE (не альбом) --------
+    prev = get_seen_state(chat.id, message.message_id)
+    had_mention_before = bool(prev.get("had_mention")) if prev else False
 
-    # одно сообщение -> один раз
-    if was_processed(message.chat.id, message.message_id):
-        logger.info("⏭ Пропуск: message уже обработан (chat=%s msg=%s)", message.chat.id, message.message_id)
-        return
+    # обновляем state (если уже True — остаётся True)
+    if mention_now or had_mention_before:
+        set_seen_state(chat.id, message.message_id, True)
+    else:
+        set_seen_state(chat.id, message.message_id, False)
 
-    # защита от повторных апдейтов
-    event_key = f"SINGLE_EVT:{message.chat.id}:{message.message_id}:{_mk_hash(content)}"
-    if is_duplicate_event(event_key):
-        logger.info("⏭ Пропуск дубля SINGLE_EVT: %s", event_key)
-        return
+    # ✅ Правило:
+    # 1) Если это НОВОЕ сообщение с тегом — переслать сразу.
+    # 2) Если это EDITED и тег появился впервые — переслать.
+    # 3) Все остальные случаи — игнор (включая повторы старых апдейтов).
+    is_new_message = (prev is None)
 
-    number = REQUEST_COUNTER
-    meta = make_meta(message)
-    thread_id = get_thread_id_for_chat(meta["chat_id"])
+    should_send_new = (is_new_message and (not is_edited) and mention_now)
+    should_send_edit_added = (is_edited and mention_now and not had_mention_before)
 
-    # header
-    kwargs_header = {"text": build_header(meta, number), "parse_mode": "HTML"}
-    if thread_id is not None:
-        kwargs_header["message_thread_id"] = thread_id
-    send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
+    if should_send_new or should_send_edit_added:
+        num = REQUEST_COUNTER
+        REQUEST_COUNTER += 1
+        save_counter(REQUEST_COUNTER)
+        send_single_forward(context, message, num)
 
-    # forward as-is
-    kwargs_fwd = {}
-    if thread_id is not None:
-        kwargs_fwd["message_thread_id"] = thread_id
-    send_with_migration_retry(message.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
+    return
 
-    mark_processed(message.chat.id, message.message_id)
-
-    REQUEST_COUNTER += 1
-    save_counter(REQUEST_COUNTER)
-    logger.info("✅ Запит №%s (single) відправлено", number)
 
 # ----------------- RUN -----------------
 def main():
     logger.info(
-        "Bot started | USERNAME=@%s | start counter=%s | FORWARD_CHAT_ID=%s | ROUTES=%s | ALLOWED=%s | ALBUM_TTL=%ss",
-        USERNAME, REQUEST_COUNTER, FORWARD_CHAT_ID, ROUTES,
-        (len(ALLOWED_GROUP_IDS) if ALLOWED_GROUP_IDS else "ALL"),
-        ALBUM_ARCHIVE_TTL_SEC
+        "Bot started | DATA_DIR=%s | USER=@%s | counter=%s | STATE_TTL_SEC=%s | ROUTES=%s | ALLOWED=%s",
+        DATA_DIR, USERNAME, REQUEST_COUNTER, STATE_TTL_SEC, ROUTES,
+        (len(ALLOWED_GROUP_IDS) if ALLOWED_GROUP_IDS else "ALL")
     )
 
     updater = Updater(BOT_TOKEN, use_context=True)
@@ -520,19 +535,16 @@ def main():
 
     dp.add_handler(CommandHandler("topicid", topic_id))
 
-    # edited messages (когда добавили тег после редактирования)
     dp.add_handler(
         MessageHandler(
             Filters.update.edited_message & (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document),
-            check_mentions,
+            handle,
         )
     )
-
-    # normal messages
     dp.add_handler(
         MessageHandler(
             (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
-            check_mentions,
+            handle,
         )
     )
 
@@ -542,5 +554,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
