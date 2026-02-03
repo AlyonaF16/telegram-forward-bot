@@ -29,6 +29,7 @@ if not BOT_TOKEN:
 if not FORWARD_CHAT_ID_ENV:
     raise RuntimeError("FORWARD_CHAT_ID не задано в ENV")
 
+# Optional: allowlist для исходных групп
 ALLOWED_GROUP_IDS_ENV = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if ALLOWED_GROUP_IDS_ENV:
     ALLOWED_GROUP_IDS = {int(x.strip()) for x in ALLOWED_GROUP_IDS_ENV.split(",") if x.strip()}
@@ -36,6 +37,7 @@ else:
     ALLOWED_GROUP_IDS = set()  # пусто = слушаем все группы
 
 # ----------------- ROUTING BY TOPICS -----------------
+# FORMAT env: ROUTES="-100group1:thread1,-100group2:thread2"
 ROUTES_ENV = os.getenv("ROUTES", "").strip()
 ROUTES: dict[int, int] = {}
 
@@ -113,7 +115,6 @@ def send_with_migration_retry(func, *, chat_id: int, **kwargs):
         save_forward_chat_id(new_id)
         return func(chat_id=new_id, **kwargs)
 
-
 # ----------------- EVENT DEDUP -----------------
 DEDUP_FILE = "dedupe.json"
 DEDUP_TTL_SEC = 7 * 24 * 60 * 60
@@ -157,8 +158,8 @@ def is_duplicate_event(event_key: str) -> bool:
     _save_dedup(data)
     return False
 
-
 # ----------------- PROCESSED MENTIONS -----------------
+# Одне повідомлення (або альбом) -> один запит.
 PROCESSED_FILE = "processed_mentions.json"
 _processed_cache = None
 
@@ -190,10 +191,23 @@ def mark_processed(chat_id: int, message_id: int):
     data[f"{chat_id}:{message_id}"] = int(time.time())
     save_processed(data)
 
-
 # ----------------- MEDIA GROUP (ALBUMS) -----------------
-MEDIA_GROUP_DELAY_SEC = 2.5
+MEDIA_GROUP_DELAY_SEC = float(os.getenv("MEDIA_GROUP_DELAY_SEC", "2.8"))
+
+# active buffer while album is arriving
 MEDIA_GROUP_BUFFER: dict[str, dict] = {}
+
+# archive for albums without mention (so edit later can trigger)
+ALBUM_ARCHIVE_TTL_SEC = int(os.getenv("ALBUM_ARCHIVE_TTL_SEC", "3600"))  # 1 hour default
+ALBUM_ARCHIVE: dict[str, dict] = {}  # media_group_id -> {items, ts}
+
+
+def prune_album_archive():
+    now = time.time()
+    dead = [k for k, v in ALBUM_ARCHIVE.items() if (now - float(v.get("ts", now))) > ALBUM_ARCHIVE_TTL_SEC]
+    for k in dead:
+        ALBUM_ARCHIVE.pop(k, None)
+
 
 # ----------------- HELPERS -----------------
 def escape_html(s: str) -> str:
@@ -272,33 +286,20 @@ def send_album_text_only(context, meta, text: str, thread_id: Optional[int]):
     send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs)
 
 
-def flush_media_group(media_group_id, context):
+def send_album_bundle(context, *, meta, mention_text, items, media_group_id: str):
+    """Send: header + text-only + media group (all items), mark processed."""
     global REQUEST_COUNTER
 
-    bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
-    if not bucket:
+    items = sorted(items, key=lambda m: m.message_id)
+    if not items:
         return
 
-    try:
-        if bucket.get("timer"):
-            bucket["timer"].cancel()
-    except Exception:
-        pass
-
-    # если в альбоме так и не было тега — ничего не делаем
-    if not bucket.get("has_mention"):
+    # If already processed album (first msg) -> stop
+    if was_processed(meta["chat_id"], items[0].message_id):
+        logger.info("⏭ Альбом вже оброблений (chat=%s msg=%s)", meta["chat_id"], items[0].message_id)
         return
 
-    meta = bucket["meta"]
-    mention_text = bucket.get("mention_text", "")
-    items = sorted(bucket["items"], key=lambda m: m.message_id)
-
-    # Если уже обработали этот альбом (по первому msg_id) — не шлем снова
-    if items and was_processed(meta["chat_id"], items[0].message_id):
-        logger.info("⏭ Альбом уже обработан (chat=%s msg=%s)", meta["chat_id"], items[0].message_id)
-        return
-
-    # Защита от дублей по событию
+    # Dedup by album event
     event_key = f"ALBUM_EVT:{meta['chat_id']}:{media_group_id}:{_mk_hash(mention_text)}"
     if is_duplicate_event(event_key):
         logger.info("⏭ Пропуск дубля ALBUM_EVT: %s", event_key)
@@ -313,10 +314,10 @@ def flush_media_group(media_group_id, context):
         kwargs_header["message_thread_id"] = thread_id
     send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
 
-    # 2) текст (без фото)
+    # 2) text only
     send_album_text_only(context, meta, mention_text, thread_id)
 
-    # 3) все фото/видео/доки плиткой
+    # 3) media плиткой
     media = album_to_input_media(items)
     if media:
         for i in range(0, len(media), 10):
@@ -332,7 +333,7 @@ def flush_media_group(media_group_id, context):
                 kwargs_fwd["message_thread_id"] = thread_id
             send_with_migration_retry(m.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
 
-    # помечаем весь альбом как обработанный
+    # mark processed for whole album
     for m in items:
         mark_processed(meta["chat_id"], m.message_id)
 
@@ -341,6 +342,40 @@ def flush_media_group(media_group_id, context):
     logger.info("✅ Запит №%s (album) відправлено, items=%s", number, len(items))
 
 
+def flush_media_group(media_group_id, context):
+    """Finish receiving album. If no mention -> move to archive. If mention -> send."""
+    bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
+    if not bucket:
+        return
+
+    try:
+        if bucket.get("timer"):
+            bucket["timer"].cancel()
+    except Exception:
+        pass
+
+    items = bucket.get("items", [])
+    has_mention = bucket.get("has_mention", False)
+
+    # If no mention yet -> archive it (so edit later can trigger)
+    if not has_mention:
+        prune_album_archive()
+        ALBUM_ARCHIVE[media_group_id] = {
+            "items": items,
+            "ts": time.time(),
+        }
+        logger.info("📦 Альбом без тегу збережено в архів: media_group_id=%s items=%s", media_group_id, len(items))
+        return
+
+    # if mention present -> send immediately
+    send_album_bundle(
+        context,
+        meta=bucket["meta"],
+        mention_text=bucket.get("mention_text", ""),
+        items=items,
+        media_group_id=media_group_id,
+    )
+
 # ----------------- /topicid -----------------
 def topic_id(update, context):
     message = update.message or update.edited_message
@@ -348,7 +383,6 @@ def topic_id(update, context):
         return
     thread_id = getattr(message, "message_thread_id", None)
     message.reply_text(f"chat_id = {message.chat.id}\nmessage_thread_id = {thread_id}")
-
 
 # ----------------- MAIN HANDLER -----------------
 def check_mentions(update, context):
@@ -363,7 +397,7 @@ def check_mentions(update, context):
         return
 
     media_group_id = getattr(message, "media_group_id", None)
-    content = get_message_content(message)  # может быть пустым
+    content = get_message_content(message)
     has_mention = (f"@{USERNAME}" in (content or ""))
 
     logger.info(
@@ -381,7 +415,8 @@ def check_mentions(update, context):
     )
 
     # ---- ALBUM ----
-    # ВАЖНО: ВСЕ сообщения альбома буферим всегда, даже без упоминания!
+    # ВСЕ элементы альбома буферим всегда (даже если mention=False),
+    # иначе при тегах в caption только у одного фото — мы потеряем остальные.
     if media_group_id:
         bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
         if not bucket:
@@ -395,16 +430,46 @@ def check_mentions(update, context):
 
         bucket["items"].append(message)
 
-        # если именно в этом элементе нашли тег — фиксируем мету/текст один раз
+        # если тег обнаружили на любом элементе — фиксируем 1 раз
         if has_mention and not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
             bucket["mention_text"] = content or ""
 
+            # Если этот альбом уже успел уйти в ARCHIVE (редактирование спустя время) — достаём и шлём все фото
+            prune_album_archive()
+            archived = ALBUM_ARCHIVE.pop(media_group_id, None)
+            if archived:
+                all_items = (archived.get("items") or []) + bucket["items"]
+                # убираем дубли по message_id
+                uniq = {}
+                for m in all_items:
+                    uniq[m.message_id] = m
+                all_items = list(uniq.values())
+
+                logger.info("📤 Тег додали пізніше. Дістав альбом з архіву: media_group_id=%s total_items=%s",
+                            media_group_id, len(all_items))
+
+                # Отправляем сразу (без ожидания таймера)
+                send_album_bundle(
+                    context,
+                    meta=bucket["meta"],
+                    mention_text=bucket["mention_text"],
+                    items=all_items,
+                    media_group_id=media_group_id,
+                )
+
+                # чистим активный буфер, чтобы таймер не отправил еще раз
+                try:
+                    if bucket.get("timer"):
+                        bucket["timer"].cancel()
+                except Exception:
+                    pass
+                MEDIA_GROUP_BUFFER.pop(media_group_id, None)
+
         return
 
     # ---- SINGLE ----
-    # Для не-альбомных сообщений пересылаем только когда есть тег
     if not has_mention:
         return
 
@@ -413,7 +478,7 @@ def check_mentions(update, context):
         logger.info("⏭ Пропуск: message уже обработан (chat=%s msg=%s)", message.chat.id, message.message_id)
         return
 
-    # защита от дублей по событию
+    # защита от повторных апдейтов
     event_key = f"SINGLE_EVT:{message.chat.id}:{message.message_id}:{_mk_hash(content)}"
     if is_duplicate_event(event_key):
         logger.info("⏭ Пропуск дубля SINGLE_EVT: %s", event_key)
@@ -441,12 +506,13 @@ def check_mentions(update, context):
     save_counter(REQUEST_COUNTER)
     logger.info("✅ Запит №%s (single) відправлено", number)
 
-
 # ----------------- RUN -----------------
 def main():
     logger.info(
-        "Bot started | USERNAME=@%s | start counter=%s | FORWARD_CHAT_ID=%s | ROUTES=%s | ALLOWED=%s",
-        USERNAME, REQUEST_COUNTER, FORWARD_CHAT_ID, ROUTES, (len(ALLOWED_GROUP_IDS) if ALLOWED_GROUP_IDS else "ALL")
+        "Bot started | USERNAME=@%s | start counter=%s | FORWARD_CHAT_ID=%s | ROUTES=%s | ALLOWED=%s | ALBUM_TTL=%ss",
+        USERNAME, REQUEST_COUNTER, FORWARD_CHAT_ID, ROUTES,
+        (len(ALLOWED_GROUP_IDS) if ALLOWED_GROUP_IDS else "ALL"),
+        ALBUM_ARCHIVE_TTL_SEC
     )
 
     updater = Updater(BOT_TOKEN, use_context=True)
@@ -454,6 +520,7 @@ def main():
 
     dp.add_handler(CommandHandler("topicid", topic_id))
 
+    # edited messages (когда добавили тег после редактирования)
     dp.add_handler(
         MessageHandler(
             Filters.update.edited_message & (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document),
@@ -461,6 +528,7 @@ def main():
         )
     )
 
+    # normal messages
     dp.add_handler(
         MessageHandler(
             (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
@@ -474,4 +542,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
