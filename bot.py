@@ -29,7 +29,6 @@ if not BOT_TOKEN:
 if not FORWARD_CHAT_ID_ENV:
     raise RuntimeError("FORWARD_CHAT_ID не задано в ENV")
 
-# Optional: allowlist для исходных групп
 ALLOWED_GROUP_IDS_ENV = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if ALLOWED_GROUP_IDS_ENV:
     ALLOWED_GROUP_IDS = {int(x.strip()) for x in ALLOWED_GROUP_IDS_ENV.split(",") if x.strip()}
@@ -37,9 +36,8 @@ else:
     ALLOWED_GROUP_IDS = set()  # пусто = слушаем все группы
 
 # ----------------- ROUTING BY TOPICS -----------------
-# FORMAT env: ROUTES="-100group1:thread1,-100group2:thread2"
 ROUTES_ENV = os.getenv("ROUTES", "").strip()
-ROUTES: dict[int, int] = {}  # source_chat_id -> message_thread_id
+ROUTES: dict[int, int] = {}
 
 if ROUTES_ENV:
     for pair in ROUTES_ENV.split(","):
@@ -48,9 +46,7 @@ if ROUTES_ENV:
             continue
         try:
             src_str, thread_str = pair.split(":")
-            src_id = int(src_str.strip())
-            thread_id = int(thread_str.strip())
-            ROUTES[src_id] = thread_id
+            ROUTES[int(src_str.strip())] = int(thread_str.strip())
         except ValueError:
             logger.warning("Невірний формат ROUTES пари: %s", pair)
 
@@ -58,8 +54,7 @@ if ROUTES_ENV:
 def get_thread_id_for_chat(chat_id: int) -> Optional[int]:
     return ROUTES.get(chat_id)
 
-
-# ----------------- COUNTER (GLOBAL) -----------------
+# ----------------- COUNTER -----------------
 COUNTER_FILE = "counter.txt"
 
 
@@ -77,7 +72,6 @@ def save_counter(value: int) -> None:
 
 
 REQUEST_COUNTER = load_counter()
-
 
 # ----------------- FORWARD CHAT ID PERSISTENCE -----------------
 FORWARD_CHAT_ID_FILE = "forward_chat_id.txt"
@@ -109,10 +103,6 @@ FORWARD_CHAT_ID = load_forward_chat_id()
 
 
 def send_with_migration_retry(func, *, chat_id: int, **kwargs):
-    """
-    Ловим ChatMigrated (если целевая группа мигрировала в супергруппу),
-    сохраняем новый chat_id и повторяем запрос.
-    """
     global FORWARD_CHAT_ID
     try:
         return func(chat_id=chat_id, **kwargs)
@@ -124,9 +114,9 @@ def send_with_migration_retry(func, *, chat_id: int, **kwargs):
         return func(chat_id=new_id, **kwargs)
 
 
-# ----------------- EVENT DEDUP (от повторных апдейтов) -----------------
+# ----------------- EVENT DEDUP -----------------
 DEDUP_FILE = "dedupe.json"
-DEDUP_TTL_SEC = 7 * 24 * 60 * 60  # 7 дней
+DEDUP_TTL_SEC = 7 * 24 * 60 * 60
 _dedup_cache = None
 
 
@@ -169,7 +159,6 @@ def is_duplicate_event(event_key: str) -> bool:
 
 
 # ----------------- PROCESSED MENTIONS -----------------
-# Главная логика: одно сообщение -> максимум один "запрос".
 PROCESSED_FILE = "processed_mentions.json"
 _processed_cache = None
 
@@ -193,22 +182,18 @@ def save_processed(data):
 
 def was_processed(chat_id: int, message_id: int) -> bool:
     data = load_processed()
-    key = f"{chat_id}:{message_id}"
-    return key in data
+    return f"{chat_id}:{message_id}" in data
 
 
 def mark_processed(chat_id: int, message_id: int):
     data = load_processed()
-    key = f"{chat_id}:{message_id}"
-    data[key] = int(time.time())
+    data[f"{chat_id}:{message_id}"] = int(time.time())
     save_processed(data)
 
 
 # ----------------- MEDIA GROUP (ALBUMS) -----------------
 MEDIA_GROUP_DELAY_SEC = 2.5
-# media_group_id -> {items, has_mention, meta, timer, mention_text}
 MEDIA_GROUP_BUFFER: dict[str, dict] = {}
-
 
 # ----------------- HELPERS -----------------
 def escape_html(s: str) -> str:
@@ -220,37 +205,29 @@ def get_message_content(message):
         return message.text
     if message.caption:
         return message.caption
-    return None
+    return ""
 
 
 def build_message_link(message):
     chat = message.chat
     if chat.username:
         return f"https://t.me/{chat.username}/{message.message_id}"
-
     chat_id_str = str(chat.id)
     if chat_id_str.startswith("-100"):
         return f"https://t.me/c/{chat_id_str[4:]}/{message.message_id}"
-
     return "Посилання недоступне"
 
 
 def make_meta(message):
     chat_title = message.chat.title or "Без назви"
     user = message.from_user
-
     if user:
         from_name = f"{user.first_name} {user.last_name}".strip() if user.last_name else user.first_name
         from_username = f"@{user.username}" if user.username else ""
     else:
         from_name = "Невідомий користувач"
         from_username = ""
-
-    if message.date:
-        time_str = (message.date + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        time_str = "Невідомий час"
-
+    time_str = (message.date + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S") if message.date else "Невідомий час"
     return {
         "chat_title": chat_title,
         "from_name": from_name,
@@ -284,36 +261,22 @@ def album_to_input_media(items):
 
 
 def send_album_text_only(context, meta, text: str, thread_id: Optional[int]):
-    # только текст (копия caption) без фото
-    if not text or not text.strip():
+    text = text or ""
+    if not text.strip():
         return
-
-    safe_text = escape_html(text)
     prefix = f"Переслано від {escape_html(meta['from_name'])} {escape_html(meta['from_username'])}".strip()
-    body = f"<i>{prefix}</i>\n{safe_text}"
-
-    kwargs = {
-        "text": body,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    body = f"<i>{prefix}</i>\n{escape_html(text)}"
+    kwargs = {"text": body, "parse_mode": "HTML", "disable_web_page_preview": True}
     if thread_id is not None:
         kwargs["message_thread_id"] = thread_id
-
     send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs)
 
 
 def flush_media_group(media_group_id, context):
-    """
-    Альбом:
-    - header
-    - текст отдельно (без фото)
-    - все медиа плиткой
-    """
     global REQUEST_COUNTER
 
     bucket = MEDIA_GROUP_BUFFER.pop(media_group_id, None)
-    if not bucket or not bucket.get("has_mention"):
+    if not bucket:
         return
 
     try:
@@ -322,18 +285,21 @@ def flush_media_group(media_group_id, context):
     except Exception:
         pass
 
+    # если в альбоме так и не было тега — ничего не делаем
+    if not bucket.get("has_mention"):
+        return
+
     meta = bucket["meta"]
-    mention_text = bucket.get("mention_text") or ""
+    mention_text = bucket.get("mention_text", "")
     items = sorted(bucket["items"], key=lambda m: m.message_id)
 
-    # Если уже обработали альбом (по первому msg_id) — не шлем снова
+    # Если уже обработали этот альбом (по первому msg_id) — не шлем снова
     if items and was_processed(meta["chat_id"], items[0].message_id):
         logger.info("⏭ Альбом уже обработан (chat=%s msg=%s)", meta["chat_id"], items[0].message_id)
         return
 
-    # Защита от повторных апдейтов (один и тот же альбом)
-    album_hash = _mk_hash(mention_text)
-    event_key = f"ALBUM_EVT:{meta['chat_id']}:{media_group_id}:{album_hash}"
+    # Защита от дублей по событию
+    event_key = f"ALBUM_EVT:{meta['chat_id']}:{media_group_id}:{_mk_hash(mention_text)}"
     if is_duplicate_event(event_key):
         logger.info("⏭ Пропуск дубля ALBUM_EVT: %s", event_key)
         return
@@ -341,45 +307,38 @@ def flush_media_group(media_group_id, context):
     number = REQUEST_COUNTER
     thread_id = get_thread_id_for_chat(meta["chat_id"])
 
-    try:
-        # 1) header
-        kwargs_header = {
-            "text": build_header(meta, number),
-            "parse_mode": "HTML",
-        }
-        if thread_id is not None:
-            kwargs_header["message_thread_id"] = thread_id
-        send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
+    # 1) header
+    kwargs_header = {"text": build_header(meta, number), "parse_mode": "HTML"}
+    if thread_id is not None:
+        kwargs_header["message_thread_id"] = thread_id
+    send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
 
-        # 2) text only (caption/text where mention was)
-        send_album_text_only(context, meta, mention_text, thread_id)
+    # 2) текст (без фото)
+    send_album_text_only(context, meta, mention_text, thread_id)
 
-        # 3) all media плиткой
-        media = album_to_input_media(items)
-        if media:
-            for i in range(0, len(media), 10):
-                kwargs_media = {"media": media[i:i + 10]}
-                if thread_id is not None:
-                    kwargs_media["message_thread_id"] = thread_id
-                send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs_media)
-        else:
-            # fallback — forward each
-            for m in items:
-                kwargs_fwd = {}
-                if thread_id is not None:
-                    kwargs_fwd["message_thread_id"] = thread_id
-                send_with_migration_retry(m.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
-
-        # Помечаем все элементы альбома как обработанные
+    # 3) все фото/видео/доки плиткой
+    media = album_to_input_media(items)
+    if media:
+        for i in range(0, len(media), 10):
+            kwargs_media = {"media": media[i:i + 10]}
+            if thread_id is not None:
+                kwargs_media["message_thread_id"] = thread_id
+            send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs_media)
+    else:
+        # fallback
         for m in items:
-            mark_processed(meta["chat_id"], m.message_id)
+            kwargs_fwd = {}
+            if thread_id is not None:
+                kwargs_fwd["message_thread_id"] = thread_id
+            send_with_migration_retry(m.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
 
-        REQUEST_COUNTER += 1
-        save_counter(REQUEST_COUNTER)
-        logger.info("✅ Запит №%s (album) відправлено, items=%s", number, len(items))
+    # помечаем весь альбом как обработанный
+    for m in items:
+        mark_processed(meta["chat_id"], m.message_id)
 
-    except Exception as e:
-        logger.exception("❌ Помилка альбому %s: %s", media_group_id, e)
+    REQUEST_COUNTER += 1
+    save_counter(REQUEST_COUNTER)
+    logger.info("✅ Запит №%s (album) відправлено, items=%s", number, len(items))
 
 
 # ----------------- /topicid -----------------
@@ -403,15 +362,9 @@ def check_mentions(update, context):
     if ALLOWED_GROUP_IDS and chat.id not in ALLOWED_GROUP_IDS:
         return
 
-    # содержимое для поиска тега
-    content = get_message_content(message) or ""
-    has_mention = (f"@{USERNAME}" in content)
-
-    # если тега нет — ничего не делаем
-    if not has_mention:
-        return
-
     media_group_id = getattr(message, "media_group_id", None)
+    content = get_message_content(message)  # может быть пустым
+    has_mention = (f"@{USERNAME}" in (content or ""))
 
     logger.info(
         "Update: chat_id=%s msg_id=%s edited=%s media_group_id=%s mention=%s text=%s caption=%s photo=%s video=%s doc=%s",
@@ -428,16 +381,11 @@ def check_mentions(update, context):
     )
 
     # ---- ALBUM ----
+    # ВАЖНО: ВСЕ сообщения альбома буферим всегда, даже без упоминания!
     if media_group_id:
         bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
         if not bucket:
-            bucket = {
-                "items": [],
-                "has_mention": False,
-                "meta": None,
-                "timer": None,
-                "mention_text": "",
-            }
+            bucket = {"items": [], "has_mention": False, "meta": None, "timer": None, "mention_text": ""}
             MEDIA_GROUP_BUFFER[media_group_id] = bucket
 
             t = threading.Timer(MEDIA_GROUP_DELAY_SEC, flush_media_group, args=(media_group_id, context))
@@ -445,27 +393,28 @@ def check_mentions(update, context):
             bucket["timer"] = t
             t.start()
 
-        # ВАЖНО: НИЧЕГО не фильтруем по processed здесь,
-        # иначе потеряем остальные фото альбома.
         bucket["items"].append(message)
 
-        # фиксируем мету/текст 1 раз
-        if not bucket["has_mention"]:
+        # если именно в этом элементе нашли тег — фиксируем мету/текст один раз
+        if has_mention and not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
-            bucket["mention_text"] = content
+            bucket["mention_text"] = content or ""
 
         return
 
     # ---- SINGLE ----
-    # одно сообщение -> один запрос. После — игнор.
+    # Для не-альбомных сообщений пересылаем только когда есть тег
+    if not has_mention:
+        return
+
+    # одно сообщение -> один раз
     if was_processed(message.chat.id, message.message_id):
         logger.info("⏭ Пропуск: message уже обработан (chat=%s msg=%s)", message.chat.id, message.message_id)
         return
 
-    # доп. защита от дублей одного и того же апдейта
-    content_hash = _mk_hash(content)
-    event_key = f"SINGLE_EVT:{message.chat.id}:{message.message_id}:{content_hash}"
+    # защита от дублей по событию
+    event_key = f"SINGLE_EVT:{message.chat.id}:{message.message_id}:{_mk_hash(content)}"
     if is_duplicate_event(event_key):
         logger.info("⏭ Пропуск дубля SINGLE_EVT: %s", event_key)
         return
@@ -474,31 +423,23 @@ def check_mentions(update, context):
     meta = make_meta(message)
     thread_id = get_thread_id_for_chat(meta["chat_id"])
 
-    try:
-        # header
-        kwargs_header = {
-            "text": build_header(meta, number),
-            "parse_mode": "HTML",
-        }
-        if thread_id is not None:
-            kwargs_header["message_thread_id"] = thread_id
-        send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
+    # header
+    kwargs_header = {"text": build_header(meta, number), "parse_mode": "HTML"}
+    if thread_id is not None:
+        kwargs_header["message_thread_id"] = thread_id
+    send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
 
-        # forward as-is
-        kwargs_fwd = {}
-        if thread_id is not None:
-            kwargs_fwd["message_thread_id"] = thread_id
-        send_with_migration_retry(message.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
+    # forward as-is
+    kwargs_fwd = {}
+    if thread_id is not None:
+        kwargs_fwd["message_thread_id"] = thread_id
+    send_with_migration_retry(message.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
 
-        # mark processed (ключевая логика)
-        mark_processed(message.chat.id, message.message_id)
+    mark_processed(message.chat.id, message.message_id)
 
-        REQUEST_COUNTER += 1
-        save_counter(REQUEST_COUNTER)
-        logger.info("✅ Запит №%s (single) відправлено", number)
-
-    except Exception as e:
-        logger.exception("❌ Помилка при пересиланні: %s", e)
+    REQUEST_COUNTER += 1
+    save_counter(REQUEST_COUNTER)
+    logger.info("✅ Запит №%s (single) відправлено", number)
 
 
 # ----------------- RUN -----------------
@@ -513,7 +454,6 @@ def main():
 
     dp.add_handler(CommandHandler("topicid", topic_id))
 
-    # edited messages (когда добавили тег после редактирования)
     dp.add_handler(
         MessageHandler(
             Filters.update.edited_message & (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document),
@@ -521,7 +461,6 @@ def main():
         )
     )
 
-    # normal messages
     dp.add_handler(
         MessageHandler(
             (Filters.text | Filters.caption | Filters.photo | Filters.video | Filters.document) & ~Filters.command,
