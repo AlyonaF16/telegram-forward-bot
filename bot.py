@@ -38,15 +38,16 @@ if not BOT_TOKEN:
 if not FORWARD_CHAT_ID_ENV:
     raise RuntimeError("FORWARD_CHAT_ID не задано в ENV")
 
-STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "28800"))  # 8 часов
+STATE_TTL_SEC = int(os.getenv("STATE_TTL_SEC", "28800"))  # 8 часов памяти
 MEDIA_GROUP_DELAY_SEC = float(os.getenv("MEDIA_GROUP_DELAY_SEC", "3.0"))  # сборка альбома
 
 ALLOWED_GROUP_IDS_ENV = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if ALLOWED_GROUP_IDS_ENV:
     ALLOWED_GROUP_IDS = {int(x.strip()) for x in ALLOWED_GROUP_IDS_ENV.split(",") if x.strip()}
 else:
-    ALLOWED_GROUP_IDS = set()
+    ALLOWED_GROUP_IDS = set()  # пусто = слушаем все группы
 
+# ROUTES env: "-100src1:thread1,-100src2:thread2"
 ROUTES_ENV = os.getenv("ROUTES", "").strip()
 ROUTES: Dict[int, int] = {}
 if ROUTES_ENV:
@@ -289,23 +290,9 @@ def album_key(chat_id: int, media_group_id: str) -> str:
 
 
 def _normalize_album_record(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Обновляем структуру на новую:
-    - items_map: { "<msg_id>": {"type":..., "file_id":...} }
-    """
     if "items_map" in rec and isinstance(rec["items_map"], dict):
         return rec
-
-    # совместимость со старым форматом: items: [ {type,file_id}, ... ]
-    items_map = {}
-    old_items = rec.get("items") or []
-    if isinstance(old_items, list):
-        # не знаем message_id, поэтому кладем искусственные ключи, но это только для старых записей
-        # новые апдейты перепишут корректно
-        for idx, it in enumerate(old_items):
-            items_map[f"old_{idx}"] = it
-
-    rec["items_map"] = items_map
+    rec["items_map"] = {}
     rec.pop("items", None)
     return rec
 
@@ -331,8 +318,7 @@ def add_album_media(chat_id: int, media_group_id: str, message) -> None:
 
     item = _extract_media_item(message)
     if item:
-        # ✅ дедуп по message_id: одно сообщение -> один элемент
-        rec["items_map"][str(message.message_id)] = item
+        rec["items_map"][str(message.message_id)] = item  # ✅ dedupe by message_id
 
     data[key] = rec
     save_albums(data)
@@ -364,9 +350,6 @@ def get_album(chat_id: int, media_group_id: str) -> Optional[Dict[str, Any]]:
 
 
 def build_media_group_from_album(items_map: Dict[str, Dict[str, str]]):
-    """
-    Собираем медиа по порядку message_id (если ключи числовые).
-    """
     def sort_key(k: str) -> Tuple[int, str]:
         try:
             return (0, int(k))
@@ -453,7 +436,6 @@ def send_text_only_like_forward(context, meta: Dict[str, Any], text: str, thread
 def send_album(context, chat_id: int, media_group_id: str, number: int):
     alb = get_album(chat_id, media_group_id)
     if not alb:
-        logger.warning("Album not found chat=%s mg=%s", chat_id, media_group_id)
         return
 
     meta = alb.get("meta")
@@ -461,26 +443,22 @@ def send_album(context, chat_id: int, media_group_id: str, number: int):
     mention_text = alb.get("mention_text") or ""
 
     if not meta or not items_map:
-        logger.warning("Album incomplete chat=%s mg=%s meta=%s items=%s", chat_id, media_group_id, bool(meta), len(items_map))
         return
 
     thread_id = get_thread_id_for_chat(chat_id)
-
     pkey = f"ALBUM_SENT:{chat_id}:{media_group_id}"
     if is_processed(pkey):
-        logger.info("Skip already sent album %s", pkey)
         return
 
     send_header(context, meta, number, thread_id)
     send_text_only_like_forward(context, meta, mention_text, thread_id)
 
     media = build_media_group_from_album(items_map)
-    if media:
-        for i in range(0, len(media), 10):
-            kwargs = {"media": media[i:i + 10]}
-            if thread_id is not None:
-                kwargs["message_thread_id"] = thread_id
-            send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs)
+    for i in range(0, len(media), 10):
+        kwargs = {"media": media[i:i + 10]}
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs)
 
     mark_processed_key(pkey)
     logger.info("✅ Album sent chat=%s mg=%s items=%s", chat_id, media_group_id, len(items_map))
@@ -493,7 +471,6 @@ def send_single_forward(context, message, number: int):
 
     pkey = f"MSG_SENT:{chat_id}:{message.message_id}"
     if is_processed(pkey):
-        logger.info("Skip already sent msg %s", pkey)
         return
 
     send_header(context, meta, number, thread_id)
@@ -532,45 +509,70 @@ def handle(update, context):
     mention_now = has_tag(content)
     media_group_id = getattr(message, "media_group_id", None)
 
-    logger.info(
-        "Update: chat_id=%s msg_id=%s edited=%s media_group_id=%s mention_now=%s",
-        chat.id, message.message_id, is_edited, media_group_id, mention_now
-    )
-
-    # -------- ALBUM --------
+    # ----------------- ALBUM -----------------
     if media_group_id:
         add_album_media(chat.id, str(media_group_id), message)
 
         alb = get_album(chat.id, str(media_group_id))
         had_mention_before = bool(alb.get("had_mention")) if alb else False
 
-        if mention_now and not had_mention_before:
+        # ⚠️ предохранитель по дублям
+        already_sent_album = is_processed(f"ALBUM_SENT:{chat.id}:{media_group_id}")
+
+        # ✅ Новое альбомное сообщение с тегом (обычно caption на 1-м элементе)
+        if (not is_edited) and mention_now and (not had_mention_before) and (not already_sent_album):
             meta = make_meta(message)
             set_album_state(chat.id, str(media_group_id), True, content or "", meta)
             schedule_album_send(context, chat.id, str(media_group_id))
-        else:
-            # если тег уже был — просто перезапускаем таймер, чтобы добрать все элементы
-            if had_mention_before:
-                schedule_album_send(context, chat.id, str(media_group_id))
-            else:
-                # обновим meta пока тег не появился
+            return
+
+        # ✅ Edited альбом: пересылать ТОЛЬКО если бот раньше видел альбом без тега,
+        # и сейчас тег появился впервые.
+        # Если alb отсутствует/пустой раньше — значит бот не видел "до" → не слать.
+        if is_edited:
+            # если мы раньше не фиксировали этот альбом вообще — игнор
+            if not alb:
+                return
+            # если уже отправляли — игнор
+            if already_sent_album:
+                return
+            # если раньше тега не было, а теперь появился — слать
+            if (not had_mention_before) and mention_now:
                 meta = make_meta(message)
-                set_album_state(chat.id, str(media_group_id), False, alb.get("mention_text", "") if alb else "", meta)
+                set_album_state(chat.id, str(media_group_id), True, content or "", meta)
+                schedule_album_send(context, chat.id, str(media_group_id))
+                return
+            # иначе (смайл/буква/что угодно) — игнор
+            return
+
+        # если тег уже был ранее — просто перезапускаем таймер, чтобы добрать элементы (и отправить 1 раз)
+        if had_mention_before and (not already_sent_album):
+            schedule_album_send(context, chat.id, str(media_group_id))
 
         return
 
-    # -------- SINGLE --------
+    # ----------------- SINGLE -----------------
     prev = get_seen_state(chat.id, message.message_id)
     had_mention_before = bool(prev.get("had_mention")) if prev else False
 
+    already_sent = is_processed(f"MSG_SENT:{chat.id}:{message.message_id}")
+    if already_sent:
+        # ✅ если уже отправляли — любые edits игнор
+        return
+
+    # записываем state (для будущих edits)
     if mention_now or had_mention_before:
         set_seen_state(chat.id, message.message_id, True)
     else:
         set_seen_state(chat.id, message.message_id, False)
 
-    is_new_message = (prev is None)
-    should_send_new = is_new_message and (not is_edited) and mention_now
-    should_send_edit_added = is_edited and mention_now and not had_mention_before
+    is_new = (prev is None)
+
+    # 1) новое сообщение с тегом
+    should_send_new = (not is_edited) and is_new and mention_now
+
+    # 2) edited: ТОЛЬКО если prev существует и было без тега, стало с тегом
+    should_send_edit_added = is_edited and (prev is not None) and (not had_mention_before) and mention_now
 
     if should_send_new or should_send_edit_added:
         num = REQUEST_COUNTER
