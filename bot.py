@@ -124,7 +124,7 @@ def send_with_migration_retry(func, *, chat_id: int, **kwargs):
         return func(chat_id=new_id, **kwargs)
 
 
-# ----------------- DEDUP (альбомный, от повторных апдейтов) -----------------
+# ----------------- EVENT DEDUP (от повторных апдейтов) -----------------
 DEDUP_FILE = "dedupe.json"
 DEDUP_TTL_SEC = 7 * 24 * 60 * 60  # 7 дней
 _dedup_cache = None
@@ -170,8 +170,6 @@ def is_duplicate_event(event_key: str) -> bool:
 
 # ----------------- PROCESSED MENTIONS -----------------
 # Главная логика: одно сообщение -> максимум один "запрос".
-# И особенно: если сообщение редактируют хоть 100 раз — пересылаем только
-# в момент, когда тег появился первый раз.
 PROCESSED_FILE = "processed_mentions.json"
 _processed_cache = None
 
@@ -311,7 +309,6 @@ def flush_media_group(media_group_id, context):
     - header
     - текст отдельно (без фото)
     - все медиа плиткой
-    Условие: пересылать только один раз (когда тег появился).
     """
     global REQUEST_COUNTER
 
@@ -329,14 +326,12 @@ def flush_media_group(media_group_id, context):
     mention_text = bucket.get("mention_text") or ""
     items = sorted(bucket["items"], key=lambda m: m.message_id)
 
-    # Если уже обработали хотя бы одно сообщение альбома — не шлем повторно
-    # (на практике достаточно проверить первое по порядку).
-    if items:
-        if was_processed(meta["chat_id"], items[0].message_id):
-            logger.info("⏭ Альбом уже обработан (chat=%s msg=%s)", meta["chat_id"], items[0].message_id)
-            return
+    # Если уже обработали альбом (по первому msg_id) — не шлем снова
+    if items and was_processed(meta["chat_id"], items[0].message_id):
+        logger.info("⏭ Альбом уже обработан (chat=%s msg=%s)", meta["chat_id"], items[0].message_id)
+        return
 
-    # Защита от повторных апдейтов одним и тем же альбомом
+    # Защита от повторных апдейтов (один и тот же альбом)
     album_hash = _mk_hash(mention_text)
     event_key = f"ALBUM_EVT:{meta['chat_id']}:{media_group_id}:{album_hash}"
     if is_duplicate_event(event_key):
@@ -356,10 +351,10 @@ def flush_media_group(media_group_id, context):
             kwargs_header["message_thread_id"] = thread_id
         send_with_migration_retry(context.bot.send_message, chat_id=FORWARD_CHAT_ID, **kwargs_header)
 
-        # 2) text only
+        # 2) text only (caption/text where mention was)
         send_album_text_only(context, meta, mention_text, thread_id)
 
-        # 3) media group
+        # 3) all media плиткой
         media = album_to_input_media(items)
         if media:
             for i in range(0, len(media), 10):
@@ -368,20 +363,20 @@ def flush_media_group(media_group_id, context):
                     kwargs_media["message_thread_id"] = thread_id
                 send_with_migration_retry(context.bot.send_media_group, chat_id=FORWARD_CHAT_ID, **kwargs_media)
         else:
-            # fallback
+            # fallback — forward each
             for m in items:
                 kwargs_fwd = {}
                 if thread_id is not None:
                     kwargs_fwd["message_thread_id"] = thread_id
                 send_with_migration_retry(m.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
 
-        # Помечаем все элементы альбома как обработанные (чтобы любые edits не триггерили повторно)
+        # Помечаем все элементы альбома как обработанные
         for m in items:
             mark_processed(meta["chat_id"], m.message_id)
 
         REQUEST_COUNTER += 1
         save_counter(REQUEST_COUNTER)
-        logger.info("✅ Запит №%s (album) відправлено", number)
+        logger.info("✅ Запит №%s (album) відправлено, items=%s", number, len(items))
 
     except Exception as e:
         logger.exception("❌ Помилка альбому %s: %s", media_group_id, e)
@@ -392,10 +387,8 @@ def topic_id(update, context):
     message = update.message or update.edited_message
     if not message:
         return
-    chat = message.chat
     thread_id = getattr(message, "message_thread_id", None)
-    chat_id = chat.id
-    message.reply_text(f"chat_id = {chat_id}\nmessage_thread_id = {thread_id}")
+    message.reply_text(f"chat_id = {message.chat.id}\nmessage_thread_id = {thread_id}")
 
 
 # ----------------- MAIN HANDLER -----------------
@@ -420,6 +413,20 @@ def check_mentions(update, context):
 
     media_group_id = getattr(message, "media_group_id", None)
 
+    logger.info(
+        "Update: chat_id=%s msg_id=%s edited=%s media_group_id=%s mention=%s text=%s caption=%s photo=%s video=%s doc=%s",
+        chat.id,
+        getattr(message, "message_id", None),
+        bool(update.edited_message),
+        media_group_id,
+        has_mention,
+        bool(message.text),
+        bool(message.caption),
+        bool(message.photo),
+        bool(message.video),
+        bool(message.document),
+    )
+
     # ---- ALBUM ----
     if media_group_id:
         bucket = MEDIA_GROUP_BUFFER.get(media_group_id)
@@ -438,13 +445,11 @@ def check_mentions(update, context):
             bucket["timer"] = t
             t.start()
 
+        # ВАЖНО: НИЧЕГО не фильтруем по processed здесь,
+        # иначе потеряем остальные фото альбома.
         bucket["items"].append(message)
 
-        # если альбом уже когда-то обрабатывался — не надо снова на edits
-        # (проверим по самому сообщению)
-        if was_processed(message.chat.id, message.message_id):
-            return
-
+        # фиксируем мету/текст 1 раз
         if not bucket["has_mention"]:
             bucket["has_mention"] = True
             bucket["meta"] = make_meta(message)
@@ -453,13 +458,12 @@ def check_mentions(update, context):
         return
 
     # ---- SINGLE ----
-    # Ключевая логика: одно сообщение пересылаем ОДИН раз.
-    # Если сообщение редактируют после — не пересылаем.
+    # одно сообщение -> один запрос. После — игнор.
     if was_processed(message.chat.id, message.message_id):
         logger.info("⏭ Пропуск: message уже обработан (chat=%s msg=%s)", message.chat.id, message.message_id)
         return
 
-    # Доп. защита от повторных апдейтов на одном и том же тексте (редко, но бывает)
+    # доп. защита от дублей одного и того же апдейта
     content_hash = _mk_hash(content)
     event_key = f"SINGLE_EVT:{message.chat.id}:{message.message_id}:{content_hash}"
     if is_duplicate_event(event_key):
@@ -486,7 +490,7 @@ def check_mentions(update, context):
             kwargs_fwd["message_thread_id"] = thread_id
         send_with_migration_retry(message.forward, chat_id=FORWARD_CHAT_ID, **kwargs_fwd)
 
-        # mark processed (ВАЖНО!)
+        # mark processed (ключевая логика)
         mark_processed(message.chat.id, message.message_id)
 
         REQUEST_COUNTER += 1
@@ -531,6 +535,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
